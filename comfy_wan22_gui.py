@@ -3,6 +3,19 @@
 """
 ComfyUI Wan 2.2 首尾帧批量生成工具(GUI 版)
 ===========================================
+v0.8 更新日志:
+  - 改进:🖼 批量 GPT 生图 — 拆成「两次请求」流程,提高出图成功率
+    · 原流程:一次发送 prompt,要求 GPT 同时生成首帧 + 尾帧(共 2 张)
+      实际观察到 GPT 经常只生成 1 张,或者把两帧合并成一张拼接图输出
+    · 新流程:先发 prompt A 只要首帧(1 张),等图到手回填 start,
+      再发 prompt B 基于上一张要尾帧(1 张,强调同一场景同一构图),
+      等图到手回填 end
+    · 更稳定,同时两次请求之间 GPT 能基于 "上一张图" 生成更一致的尾帧
+  - 改进:📐 默认方向改为横屏 16:9(960×544)
+    · 新项目更适合做横版短剧/解说视频
+    · 竖屏 9:16 仍可一键切换
+  - 说明:此版本不修改 workflow 本身的分辨率行为,只改 UI 默认值和 GPT 请求文案
+
 v0.7 更新日志:
   - 新增:📐 分辨率设置 UI — 横屏/竖屏/方图切换,宽高帧数可在主界面直接改
     · 节点配置第 2 行:竖屏 9:16 / 横屏 16:9 / 方图 1:1 / 自定义 下拉
@@ -53,7 +66,7 @@ v0.1 更新日志:
 运行:python comfy_wan22_gui.py
 """
 
-__version__ = "0.7"
+__version__ = "0.8"
 
 import os
 import sys
@@ -1519,10 +1532,10 @@ class ComfyBatchGUI:
         self.end_node_var = tk.StringVar()
         self.prompt_node_var = tk.StringVar()
         self.prompt_field_var = tk.StringVar(value="text")
-        # 分辨率
-        self.orient_var = tk.StringVar(value="竖屏 9:16")
-        self.width_var = tk.IntVar(value=544)
-        self.height_var = tk.IntVar(value=960)
+        # 分辨率(v0.8 默认改成横屏,配合拆分成两次 GPT 调用的新流程)
+        self.orient_var = tk.StringVar(value="横屏 16:9")
+        self.width_var = tk.IntVar(value=960)
+        self.height_var = tk.IntVar(value=544)
         self.length_var = tk.IntVar(value=81)
         self.log_q = queue.Queue()
         self.worker = None
@@ -1807,11 +1820,11 @@ class ComfyBatchGUI:
             self.end_node_var.set(c.get("end_node", ""))
             self.prompt_node_var.set(c.get("prompt_node", ""))
             self.prompt_field_var.set(c.get("prompt_field", "text"))
-            # 分辨率
-            self.width_var.set(c.get("width", 544))
-            self.height_var.set(c.get("height", 960))
+            # 分辨率(v0.8 默认横屏 — 如果 config 里没有相关 key,走 v0.8 默认)
+            self.width_var.set(c.get("width", 960))
+            self.height_var.set(c.get("height", 544))
             self.length_var.set(c.get("length", 81))
-            self.orient_var.set(c.get("orient", "竖屏 9:16"))
+            self.orient_var.set(c.get("orient", "横屏 16:9"))
             # AI 配置
             self.ai_key_var.set(c.get("ai_key", ""))
             self.ai_base_var.set(c.get("ai_base", DEFAULT_OPENAI_BASE))
@@ -3218,7 +3231,7 @@ class ComfyBatchGUI:
         """启动时加载两份提示词库,并给出默认值"""
         gpt_defaults = [
             {"title": "让 GPT 生成分镜首帧",
-             "text": "请按照下面分镜描述,生成一张国漫条漫风格的竖版 9:16 首帧图:\n\n[在这里粘贴分镜描述]"},
+             "text": "请按照下面分镜描述,生成一张国漫条漫风格的横版 16:9 首帧图:\n\n[在这里粘贴分镜描述]"},
             {"title": "让 GPT 生成分镜尾帧",
              "text": "基于上一张图的角色和场景,生成对应的尾帧图,展示动作完成后的状态:\n\n[动作描述]"},
             {"title": "人物设定图(三视图)",
@@ -4238,6 +4251,112 @@ class ComfyBatchGUI:
             daemon=True)
         self.worker.start()
 
+    # ----- 常量:人物关键词(v0.8 把它提成类常量,首帧/尾帧模板共用)-----
+    _PEOPLE_KEYWORDS = (
+        "林默", "林渊", "苏郁", "眼镜反派", "刀疤青年", "妈妈",
+        "主角", "渊哥", "男子", "女子", "男人", "女人",
+        "青年", "中年", "老人", "少年", "少女",
+        "学生", "角色", "柜员", "混混", "打手", "服务员",
+        "男孩", "女孩", "女性", "男性",
+        "手部", "手指", "拳头", "手握", "手持",
+        "侧脸", "侧影", "背影", "人影", "身影", "身躯",
+    )
+
+    def _build_start_frame_prompt(self, raw, has_people):
+        """v0.8 两次调用:第一次请求【只要一张首帧图】。
+
+        关键:明确告诉 GPT "只要 1 张,不是两张",因为单图请求
+        比两图请求稳定得多 — 之前观察到 GPT 经常把两帧合并成一张拼接图输出。
+        """
+        if has_people:
+            tail = (
+                "━━━━━━━━━━━━━━━━━━━━━━━\n"
+                "请根据以上描述,生成【首帧图】一张(横屏 16:9)。\n\n"
+                "【硬性要求】\n"
+                "1. ⭐ 本次【只要 1 张图】,不要生成两张拼接图,也不要首尾帧并排\n"
+                "2. ❌ 不要添加描述里【没有提到】的人物、道具、建筑、文字招牌\n"
+                "3. ❌ 不要出现日文/韩文招牌文字,故事背景是中国都市\n"
+                "4. ✅ 上传的参考图是角色/道具的外观参考,必须严格遵循其外貌特征\n"
+                "5. ✅ 这张图用于后续尾帧的构图基准,需场景/人物特征清晰可辨"
+            )
+        else:
+            tail = (
+                "━━━━━━━━━━━━━━━━━━━━━━━\n"
+                "请根据以上描述,生成【首帧图】一张(横屏 16:9)。\n\n"
+                "【⚠️ 这是纯环境空镜,硬性要求】\n"
+                "1. ⭐ 本次【只要 1 张图】,不要生成两张拼接图\n"
+                "2. ❌❌❌ 画面中绝对不得出现任何人物、剪影、背影、手、脸或人影 ❌❌❌\n"
+                "3. 只拍建筑、街道、天空、云层、水面、雨幕、室内陈设、物品等环境元素\n"
+                "4. ❌ 不要添加描述里【没有提到】的建筑、文字招牌、道具\n"
+                "5. ❌ 不要出现日文/韩文招牌文字,故事背景是中国都市"
+            )
+        return raw + "\n\n" + tail
+
+    def _build_end_frame_prompt(self, raw, has_people):
+        """v0.8 两次调用:第二次请求【基于上一张生成尾帧】。
+
+        关键:强调"基于刚才那张首帧"、"同一场景同一机位",
+        GPT 会引用上下文中的首帧图像,生成动作延续一帧 → 最适合 Wan 2.2 插值。
+        """
+        if has_people:
+            tail = (
+                "━━━━━━━━━━━━━━━━━━━━━━━\n"
+                "请基于你【刚刚生成的首帧图】,生成对应的【尾帧图】一张(横屏 16:9)。\n\n"
+                "【硬性要求】\n"
+                "1. ⭐ 本次【只要 1 张图】,不要生成两张拼接图\n"
+                "2. ⭐ 必须是【同一场景、同一镜头角度、同一机位】的延续瞬间,"
+                "只有主体细微的动作/表情/光线变化(用于制作首尾帧动画过渡)\n"
+                "3. ❌ 不要换场景(比如一张街景一张室内)\n"
+                "4. ❌ 不要换角度/机位/构图\n"
+                "5. ❌ 不要出现日文/韩文招牌文字\n"
+                "6. ✅ 保持画面风格、色调、人物造型、服装、场景细节与首帧【完全一致】\n"
+                "7. ✅ 人物特征必须与首帧及参考图一致(脸型/服装/发型不得改)"
+            )
+        else:
+            tail = (
+                "━━━━━━━━━━━━━━━━━━━━━━━\n"
+                "请基于你【刚刚生成的首帧图】,生成对应的【尾帧图】一张(横屏 16:9)。\n\n"
+                "【⚠️ 这是纯环境空镜,硬性要求】\n"
+                "1. ⭐ 本次【只要 1 张图】,不要生成两张拼接图\n"
+                "2. ❌❌❌ 画面中仍然绝对不得出现任何人物、剪影、背影、手、脸或人影 ❌❌❌\n"
+                "3. ⭐ 必须是【同一场景、同一角度、同一构图】,只有光线/气氛/镜头距离的细微变化\n"
+                "4. ❌ 不要添加首帧【没有出现】的建筑、文字招牌、道具\n"
+                "5. ❌ 不要出现日文/韩文招牌文字\n"
+                "6. ✅ 保持画面风格、色调、构图、场景细节与首帧【完全一致】"
+            )
+        return raw + "\n\n" + tail
+
+    def _request_single_gpt_image(self, gpt_text, timeout=300, stable_seconds=5):
+        """发一次请求 → 等 1 张新图 → 返回新图 URL 列表(可能 >1,由调用者挑)。
+
+        返回 (saved_urls, before_snapshot) 元组:
+          - saved_urls: 新增图 URL(至少 1 张,否则返回 [])
+          - before_snapshot: 发送前对话区已有的 URL 快照(便于下一次调用对比)
+        """
+        # 记录发送前基线
+        try:
+            before_urls = self.gpt_ctrl.get_last_images()
+        except Exception:
+            before_urls = []
+        self._log(f"     📊 发送前对话区已有 {len(before_urls)} 张图")
+
+        # 发送
+        self.gpt_ctrl.send(gpt_text, wait_reply=False)
+        self._log(f"     ⏳ 等待 GPT 生成...")
+
+        # 等 1 张新图即可(因为我们每次只要 1 张)
+        urls = self.gpt_ctrl.wait_for_images(
+            min_count=1, timeout=timeout, stable_seconds=stable_seconds,
+            before_urls=before_urls)
+        # 尽量多拿:如果 GPT 偶尔还是冒出 2 张,保留更多让调用者挑
+        try:
+            later = self.gpt_ctrl.get_new_images(before_urls)
+            if len(later) > len(urls):
+                urls = later
+        except Exception:
+            pass
+        return urls, before_urls
+
     def _batch_gpt_images(self, save_dir, only_missing):
         Path(save_dir).mkdir(parents=True, exist_ok=True)
         # 确保素材库索引已建
@@ -4251,7 +4370,8 @@ class ComfyBatchGUI:
 
         total = len(self.scenes)
         done = 0
-        self._log(f"\n🖼 开始批量 GPT 生图(共 {total} 个场景,目标目录:{save_dir})")
+        self._log(f"\n🖼 开始批量 GPT 生图 v0.8 两次调用模式"
+                  f"(共 {total} 个场景,目标目录:{save_dir})")
 
         for i, s in enumerate(self.scenes):
             if self.stop_flag.is_set():
@@ -4262,59 +4382,22 @@ class ComfyBatchGUI:
 
             self._log(f"\n🎨 [{i+1}/{total}] {s['name']}")
             try:
-                # 1. 组装 prompt:优先 gpt_prompt,fallback 到主 prompt
+                # ─── 1. 组装基础 prompt ───
                 raw = (s.get("gpt_prompt") or "").strip() or (s.get("prompt") or "").strip()
                 if not raw:
                     self._log("   ⚠️ 无 prompt,跳过")
                     continue
 
-                # 2. 注入色板前缀
+                # 注入色板前缀
                 cid = s.get("color", "")
                 if cid and self.auto_inject_color_var.get():
                     raw = self.color_anchors.inject(raw, cid)
                     self._log(f"   🎨 已注入色板:{self.color_anchors.get_name(cid)}")
 
-                # 3. 补一段严格的「首尾帧生成」指令,确保两张图可用于 Wan 2.2 首尾帧动画
-                #    根据 prompt 里有无人物,分两种模板,避免"人物一致"反向提示空镜添加人物
-                _PEOPLE_KEYWORDS = (
-                    "林默", "林渊", "苏郁", "眼镜反派", "刀疤青年", "妈妈",
-                    "主角", "渊哥", "男子", "女子", "男人", "女人",
-                    "青年", "中年", "老人", "少年", "少女",
-                    "学生", "角色", "柜员", "混混", "打手", "服务员",
-                    "男孩", "女孩", "女性", "男性",
-                    "手部", "手指", "拳头", "手握", "手持",
-                    "侧脸", "侧影", "背影", "人影", "身影", "身躯",
-                )
-                has_people = any(kw in raw for kw in _PEOPLE_KEYWORDS)
-                if has_people:
-                    tail = (
-                        "━━━━━━━━━━━━━━━━━━━━━━━\n"
-                        "请根据以上描述,生成【首帧图】和【尾帧图】各一张(共 2 张,竖屏 9:16)。\n\n"
-                        "【硬性要求】\n"
-                        "1. 两张图必须是【同一场景、同一镜头角度、同一机位】的两个连续瞬间,"
-                        "只有主体细微的动作/表情/光线变化(用于制作首尾帧动画过渡)\n"
-                        "2. ❌ 不要生成两个不同的场景(比如一张街景一张室内)\n"
-                        "3. ❌ 不要添加描述里【没有提到】的人物、道具、建筑、文字招牌\n"
-                        "4. ❌ 不要出现日文/韩文招牌文字,故事背景是中国都市\n"
-                        "5. ✅ 保持画面风格、色调、人物造型、服装、场景细节完全一致\n"
-                        "6. ✅ 上传的参考图是角色/道具的外观参考,必须严格遵循其外貌特征"
-                    )
-                else:
-                    tail = (
-                        "━━━━━━━━━━━━━━━━━━━━━━━\n"
-                        "请根据以上描述,生成【首帧图】和【尾帧图】各一张(共 2 张,竖屏 9:16)。\n\n"
-                        "【⚠️ 这是纯环境空镜,硬性要求】\n"
-                        "1. ❌❌❌ 画面中绝对不得出现任何人物、剪影、背影、手、脸或人影 ❌❌❌\n"
-                        "2. 只拍建筑、街道、天空、云层、水面、雨幕、室内陈设、物品等环境元素\n"
-                        "3. 两张图必须是【同一场景、同一角度、同一构图】,只有光线/气氛/镜头距离的细微变化\n"
-                        "4. ❌ 不要添加描述里【没有提到】的建筑、文字招牌、道具\n"
-                        "5. ❌ 不要出现日文/韩文招牌文字,故事背景是中国都市\n"
-                        "6. ✅ 保持画面风格、色调、构图、场景细节完全一致"
-                    )
-                gpt_text = raw + "\n\n" + tail
+                has_people = any(kw in raw for kw in self._PEOPLE_KEYWORDS)
                 self._log(f"   🧭 prompt 模式:{'人物镜头' if has_people else '纯环境空镜'}")
 
-                # 4. 匹配素材库参考图
+                # ─── 2. 素材库参考图上传(只在首帧前上传一次,尾帧请求直接复用上下文)───
                 matched = self.asset_lib.match(raw) if self.asset_lib._index else []
                 ref_paths = [p for _, p in matched]
                 if ref_paths and self.auto_upload_var.get():
@@ -4326,57 +4409,75 @@ class ComfyBatchGUI:
                     except Exception as e:
                         self._log(f"   ⚠️ 参考图上传失败(继续发送):{e}")
 
-                # 5. 记录发送前的图片数,作为等图基线
-                try:
-                    before_urls = self.gpt_ctrl.get_last_images()
-                    self._log(f"   📊 发送前对话区已有 {len(before_urls)} 张图")
-                except Exception:
-                    before_urls = []
-
-                # 6. 发送(不等文本回复,直接等图)
-                self._log(f"   📤 发送到 GPT...")
-                self.gpt_ctrl.send(gpt_text, wait_reply=False)
-
-                # 7. 等新图:【基于 before 做 delta】至少 1 张,最好 2 张,超时 5 分钟
-                self._log(f"   ⏳ 等待 GPT 生成图片(最多 5 分钟)...")
-                urls = self.gpt_ctrl.wait_for_images(
-                    min_count=2, timeout=300, stable_seconds=5,
-                    before_urls=before_urls)
-                # 如果没到 2 张,退而求其次 1 张
-                if len(urls) < 1:
-                    urls = self.gpt_ctrl.wait_for_images(
-                        min_count=1, timeout=30, stable_seconds=2,
-                        before_urls=before_urls)
-                if not urls:
-                    self._log("   ❌ 超时未拿到新图片(检查 GPT 是否真在生成 / 镜像站 DOM 是否特殊)")
-                    continue
-                self._log(f"   📥 拿到 {len(urls)} 张【本轮新增】图片 URL")
-
-                # 8. 下载到场景专属子目录(只下本轮新增的)
                 sub = Path(save_dir) / f"{i+1:02d}_{s['name']}"
-                saved = self.gpt_ctrl.download_last_images(str(sub), urls=urls)
-                if not saved:
-                    self._log("   ❌ 图片下载失败(检查浏览器 fetch 日志)")
-                    continue
-                self._log(f"   ✅ 已下载 {len(saved)} 张到 {sub}")
 
-                # 9. 回填:第 1 张 → start,第 2 张 → end(若只有 1 张则首尾相同)
+                # ─── 3. 第一次请求:生成首帧 ───
+                self._log(f"   📤 [阶段 1/2] 请求首帧图...")
+                start_prompt = self._build_start_frame_prompt(raw, has_people)
+                start_urls, _ = self._request_single_gpt_image(
+                    start_prompt, timeout=300, stable_seconds=5)
+                if not start_urls:
+                    self._log("   ❌ 首帧超时未拿到(检查 GPT / 镜像站 DOM)")
+                    continue
+                self._log(f"   📥 首帧拿到 {len(start_urls)} 张")
+
+                # 下载首帧(取第一张新图)
+                start_saved = self.gpt_ctrl.download_last_images(
+                    str(sub), urls=start_urls[:1])
+                if not start_saved:
+                    self._log("   ❌ 首帧图下载失败(检查浏览器 fetch 日志)")
+                    continue
+                start_path = start_saved[0]
+                self._log(f"   ✅ 首帧已保存: {start_path}")
+
+                # ─── 4. 稍等,让 GPT 会话状态稳定 ───
+                time.sleep(2)
+                if self.stop_flag.is_set():
+                    self._log("⏹ 已停止(首帧完成后)")
+                    # 至少首帧已经存下,回填 start
+                    if not only_missing or not s.get("start"):
+                        s["start"] = start_path
+                    self.scenes[i] = s
+                    self.root.after(0, self._refresh_tree)
+                    break
+
+                # ─── 5. 第二次请求:基于首帧生成尾帧 ───
+                self._log(f"   📤 [阶段 2/2] 请求尾帧图(基于首帧延续一帧)...")
+                end_prompt = self._build_end_frame_prompt(raw, has_people)
+                end_urls, _ = self._request_single_gpt_image(
+                    end_prompt, timeout=300, stable_seconds=5)
+                if not end_urls:
+                    # 尾帧失败不是致命 — 首帧已经成功,把首帧同时当尾帧回填(Wan 2.2 可以跑静态帧)
+                    self._log("   ⚠️ 尾帧超时,回退为用首帧作为尾帧(可手动替换)")
+                    end_path = start_path
+                else:
+                    self._log(f"   📥 尾帧拿到 {len(end_urls)} 张")
+                    end_saved = self.gpt_ctrl.download_last_images(
+                        str(sub), urls=end_urls[:1])
+                    if not end_saved:
+                        self._log("   ⚠️ 尾帧下载失败,回退为用首帧作为尾帧")
+                        end_path = start_path
+                    else:
+                        end_path = end_saved[0]
+                        self._log(f"   ✅ 尾帧已保存: {end_path}")
+
+                # ─── 6. 回填 start/end ───
                 if only_missing:
                     if not s.get("start"):
-                        s["start"] = saved[0]
+                        s["start"] = start_path
                     if not s.get("end"):
-                        s["end"] = saved[1] if len(saved) >= 2 else saved[0]
+                        s["end"] = end_path
                 else:
-                    s["start"] = saved[0]
-                    s["end"] = saved[1] if len(saved) >= 2 else saved[0]
+                    s["start"] = start_path
+                    s["end"] = end_path
                 self.scenes[i] = s
 
                 # 刷新 UI
                 self.root.after(0, self._refresh_tree)
                 done += 1
 
-                # 礼貌性间隔,避免被限速
-                time.sleep(2)
+                # 礼貌性间隔,避免被 GPT 限速
+                time.sleep(3)
 
             except Exception as e:
                 self._log(f"   ❌ 失败: {e}")
