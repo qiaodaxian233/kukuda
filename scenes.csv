@@ -1,0 +1,31 @@
+scene_name,start_image,end_image,prompt
+01_雨夜巷尾,imgs/s01_start.png,imgs/s01_end.png,镜头缓慢推近 雨丝斜飘 角色轮廓逐渐清晰
+02_伤势特写,imgs/s02_start.png,imgs/s02_end.png,角色低头抚伤 缓慢抬头 眼神由疲惫转锐利
+03_决定离开,imgs/s03_start.png,imgs/s03_end.png,角色撑墙站起 身体微颤 握紧手中刀
+04_躲避偷袭,imgs/s04_start.png,imgs/s04_end.png,瞳孔骤缩瞬间翻滚 武士刀钉入墙面颤动
+05_七人现身,imgs/s05_start.png,imgs/s05_end.png,七人缓步走出阴影 面容从模糊变清晰
+06_眼镜男举枪,imgs/s06_start.png,imgs/s06_end.png,反派掏枪抬手瞄准 另一手晃动追踪器
+07_对话杀意,imgs/s07_start.png,imgs/s07_end.png,两人眼神对峙 主角杀机加深 反派笑意加浓
+08_突然冲刺,imgs/s08_start.png,imgs/s08_end.png,角色猛然前冲 拖出残影 水花四溅
+09_断手刀光,imgs/s09_start.png,imgs/s09_end.png,刀光横扫 断手飞出 反派倒飞出画面
+10_胸口中弹,imgs/s10_start.png,imgs/s10_end.png,角色胸口震动 身体慢慢后仰 武士刀脱手下滑
+11_倒下瞬间,imgs/s11_start.png,imgs/s11_end.png,俯视镜头缓慢上升 角色瞳孔渐渐涣散
+12_夜空过渡,imgs/s12_start.png,imgs/s12_end.png,夜空转为晨光 云层流动 雨丝渐停
+13_清晨惊醒,imgs/s13_start.png,imgs/s13_end.png,角色猛然睁眼坐起 手按胸口
+14_疑惑低头,imgs/s14_start.png,imgs/s14_end.png,低头看手 翻转查看 捏肌肉皱眉
+15_镜中陌生人,imgs/s15_start.png,imgs/s15_end.png,角色走向镜子 镜中人浮现 抬手推眼镜
+16_试拳,imgs/s16_start.png,imgs/s16_end.png,握拳蓄势 一拳猛挥向墙壁 残影明显
+17_拳印特写,imgs/s17_start.png,imgs/s17_end.png,拳头击墙 灰尘爆开 角色收手点头
+18_翻找身份,imgs/s18_start.png,imgs/s18_end.png,角色翻找床铺 拿出学生证 镜头聚焦证件
+19_手机震动,imgs/s19_start.png,imgs/s19_end.png,手机屏幕亮起 机身微微震动
+20_犹豫接听,imgs/s20_start.png,imgs/s20_end.png,角色盯屏幕犹豫 按键接听 手机贴耳
+21_复杂情绪,imgs/s21_start.png,imgs/s21_end.png,表情从冷漠缓慢松动 眼眶渐红
+22_挂电话沉思,imgs/s22_start.png,imgs/s22_end.png,角色望镜中自己 缓慢抬手触碰镜面
+23_窗前决心,imgs/s23_start.png,imgs/s23_end.png,阳光穿透云层洒落 角色握紧拳头
+24_出租车到达,imgs/s24_start.png,imgs/s24_end.png,出租车停下 车门打开 角色下车皱眉
+25_巷中寻卡,imgs/s25_start.png,imgs/s25_end.png,角色蹲身摸索 拿出黑卡 露出笑意
+26_吻卡贴身,imgs/s26_start.png,imgs/s26_end.png,角色对光端详卡片 亲吻后塞入口袋
+27_银行取款,imgs/s27_start.png,imgs/s27_end.png,女职员递出现金 抛媚眼 角色淡然接过
+28_走出银行,imgs/s28_start.png,imgs/s28_end.png,角色走出大门 抬头望向远方大厦
+29_网吧打字,imgs/s29_start.png,imgs/s29_end.png,手指快速敲击键盘 消息发送 角色冷笑
+30_高楼电话,imgs/s30_start.png,imgs/s30_end.png,苏郁抬手贴耳 表情激动 唇语轻启
