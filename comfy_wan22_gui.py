@@ -3,6 +3,24 @@
 """
 ComfyUI Wan 2.2 首尾帧批量生成工具(GUI 版)
 ===========================================
+v0.13 更新日志:
+  - 📚 对齐:基于 OpenAI 官方 gpt-image-2 Cookbook(2026-04-21)做模板微调
+    · 官方原话:"For wide, cinematic, low-light, rain, or neon scenes,
+      add extra detail about scale, atmosphere, and color so the model
+      does not trade mood for surface realism."
+    · 雨夜场景模板补 scale(远近尺度)+ atmosphere(空气质感)说明
+    · "No glamorization, no heavy retouching" 改为官方原文措辞
+    · photorealistic 关键词提前放置,增强触发真实感模式
+    · 加入 composition cues:framing + viewpoint + lighting/mood
+
+v0.12 更新日志:
+  - 🎯 升级:4 个首尾帧模板加入「摄影质感锚定」+「反修图指令」
+    · 参考 GPT-image-2 官方 Cookbook + awesome-gpt-image 顶级案例的共性
+    · 旧模板"电影级/写实风格"→ 新模板"photorealistic candid / 35mm film / authentic slice"
+    · 加入"no glamorization / no over-retouch / no watermark"等 negative 约束
+    · 强调"中国都市"锚定,双保险避免日式霓虹文字
+    · 首帧加「构图中性,为尾帧运动留白」,尾帧加「differ from start frame visibly」
+
 v0.11 更新日志:
   - 🆕 新增:🔄 每场景新开对话 — 批量 / 单独 GPT 生图时,每个场景画完首尾帧后
     自动点 GPT 网页的「新聊天」按钮,开干净对话继续下一场景
@@ -99,7 +117,7 @@ v0.1 更新日志:
 运行:python comfy_wan22_gui.py
 """
 
-__version__ = "0.11"
+__version__ = "0.13"
 
 import os
 import sys
@@ -161,30 +179,60 @@ CONFIG_FILE = str(SCRIPT_DIR / "wan22_gui_config.json")
 
 DEFAULT_START_EMPTY_TMPL = (
     "━━━━━━━━━━━━━━━━━━━━━━━\n"
+    "Generate one image (wide 16:9 landscape).\n"
     "请根据以上描述,生成【首帧图】一张(横屏 16:9)。\n\n"
     "【⚠️ 这是纯环境空镜,硬性要求】\n"
     "1. ⭐ 本次【只要 1 张图】,不要生成两张拼接图\n"
     "2. ❌❌❌ 画面中绝对不得出现任何人物、剪影、背影、手、脸或人影 ❌❌❌\n"
     "3. 只拍建筑、街道、天空、云层、水面、雨幕、室内陈设、物品等环境元素\n"
     "4. ❌ 不要添加描述里【没有提到】的建筑、文字招牌、道具\n"
-    "5. ❌ 不要出现日文/韩文招牌文字,故事背景是中国都市\n"
-    "6. 📐 构图请预留视觉变化空间(主体不要填满画面,给尾帧相机运动留位置)"
+    "5. ❌ 不要出现日文/韩文招牌文字,故事背景是【中国都市 Chinese city】\n"
+    "6. 📐 构图请预留视觉变化空间(主体不要填满画面,给尾帧相机运动留位置)\n\n"
+    "【Photography style — anchor (official gpt-image-2 phrasing)】\n"
+    "  • Shot like a photorealistic cinematic still, captured on 35mm film.\n"
+    "  • Natural lighting, subtle film grain, authentic atmosphere.\n"
+    "  • Describe real physical detail: wet pavement reflections, visible raindrops\n"
+    "    on surfaces, mist hanging in the air, neon glow scatter in humid air.\n"
+    "  • Scale & atmosphere cues(官方针对雨夜/霓虹场景必需):\n"
+    "    — specify the distance from camera to subject (e.g. ~15m / mid-shot)\n"
+    "    — specify air humidity, street damp, how far neon light travels\n\n"
+    "【Constraints — what to avoid (official wording)】\n"
+    "  ❌ No glamorization, no heavy retouching.\n"
+    "  ❌ No HDR-like glow, no over-saturation, no plastic CGI look.\n"
+    "  ❌ No watermark, no extra text, no logos.\n"
+    "  ❌ Avoid cinematic color grading that trades mood for realism."
 )
 
 DEFAULT_START_PEOPLE_TMPL = (
     "━━━━━━━━━━━━━━━━━━━━━━━\n"
+    "Generate one image (wide 16:9 landscape).\n"
     "请根据以上描述,生成【首帧图】一张(横屏 16:9)。\n\n"
     "【硬性要求】\n"
     "1. ⭐ 本次【只要 1 张图】,不要生成两张拼接图,也不要首尾帧并排\n"
     "2. ❌ 不要添加描述里【没有提到】的人物、道具、建筑、文字招牌\n"
-    "3. ❌ 不要出现日文/韩文招牌文字,故事背景是中国都市\n"
+    "3. ❌ 不要出现日文/韩文招牌文字,故事背景是【中国都市 Chinese city】\n"
     "4. ✅ 上传的参考图是角色/道具的外观参考,必须严格遵循其外貌特征\n"
     "5. ✅ 这张图用于后续尾帧的构图基准,需场景/人物特征清晰可辨\n"
-    "6. 📐 构图请预留动作变化空间(给尾帧里人物动作或相机运动留余地)"
+    "6. 📐 构图请预留动作变化空间(给尾帧里人物动作或相机运动留余地)\n\n"
+    "【Photography style — anchor (official gpt-image-2 phrasing)】\n"
+    "  • Shot like a photorealistic candid photograph, captured on 35mm film,\n"
+    "    50mm lens, eye-level or slightly off-angle, shallow depth of field,\n"
+    "    subtle film grain, honest and unposed.\n"
+    "  • Render real skin texture with visible wrinkles, pores, sun/weather texture,\n"
+    "    imperfect hair strands, worn fabric, everyday detail.\n"
+    "  • Composition cues: specify framing(close-up/medium/wide),\n"
+    "    viewpoint(eye-level/low-angle), lighting mood(soft diffuse / harsh rim).\n\n"
+    "【Constraints — official wording, important】\n"
+    "  ❌ No glamorization.\n"
+    "  ❌ No heavy retouching.\n"
+    "  ❌ No plastic/smoothed skin, no perfect symmetry, no airbrush look.\n"
+    "  ❌ No cinematic color grading, no movie-poster styling.\n"
+    "  ❌ No watermark, no extra text, no logos."
 )
 
 DEFAULT_END_EMPTY_TMPL = (
     "━━━━━━━━━━━━━━━━━━━━━━━\n"
+    "Generate one image (wide 16:9 landscape) based on the first frame you just made.\n"
     "请基于你【刚刚生成的首帧图】,生成对应的【尾帧图】一张(横屏 16:9)。\n\n"
     "【⚠️ 这是纯环境空镜,硬性要求】\n"
     "1. ⭐ 本次【只要 1 张图】,不要生成两张拼接图\n"
@@ -192,18 +240,31 @@ DEFAULT_END_EMPTY_TMPL = (
     "3. ✅ 保持首帧的场景空间、建筑位置、物体摆放不变(是同一个地方的下一瞬间)\n"
     "4. ❌ 不要添加首帧【没有出现】的建筑、文字招牌、道具\n"
     "5. ❌ 不要出现日文/韩文招牌文字\n\n"
-    "【⚠️ 首尾帧差异硬性要求(Wan 2.2 插值必需)】\n"
-    "首尾放一起对比,必须一眼看出不同。以下三轴至少命中两轴:\n"
-    "  ① 相机运动:推/拉/升/降/摇/俯冲 任选一,位移 ≥ 画宽 10%(写死方向,不写「略」)\n"
-    "  ② 天气/光线:雨势/光强/云层/雾气 给出明确的「起始→终末」变化\n"
-    "  ③ 动态元素:水涟漪扩大、光斑扩散、霓虹闪烁、树叶风动、云影位移 至少一个\n\n"
+    "【Preserve list — 继承首帧,不要漂移(official edit pattern)】\n"
+    "  ✅ Keep the same photography style (photorealistic cinematic still, 35mm).\n"
+    "  ✅ Keep the same color temperature, grain density, and lens character.\n"
+    "  ✅ Keep the same building layout, object positions, spatial geometry.\n"
+    "  ✅ Keep camera model/sensor feel consistent — same photographer, next moment.\n\n"
+    "【⚠️ Change list — 首尾帧差异硬性要求(Wan 2.2 插值必需)】\n"
+    "Meet at least TWO of the three axes below, each described explicitly:\n"
+    "  ① Camera motion: dolly / push / pull / pan / tilt / crane\n"
+    "     — specify direction AND distance (e.g. push-in 10% of frame width)\n"
+    "  ② Weather/light: give 起始→终末 values\n"
+    "     (rain light→heavy, mist thin→dense, neon flicker off→on)\n"
+    "  ③ Dynamic elements: ripples spreading, light patches shifting,\n"
+    "     branches moving in wind, cloud drift across ~N% of frame\n\n"
     "⛔ 禁用词(出现任一就等于没动):\n"
     "  「同一机位」「同一构图」「同一角度」「只有细微变化」「几乎相同」「基本不变」\n\n"
-    "🔍 生成前自检:首尾放一起,能一眼看出相机动了/天气变了吗?不能就增强差异。"
+    "【Constraints】\n"
+    "  ❌ No glamorization, no heavy retouching.\n"
+    "  ❌ No HDR glow, no over-saturation.\n"
+    "  ❌ No watermark, no extra text.\n\n"
+    "🔍 Self-check: 首尾放一起能一眼看出相机动了/天气变了吗?不能就增强差异。"
 )
 
 DEFAULT_END_PEOPLE_TMPL = (
     "━━━━━━━━━━━━━━━━━━━━━━━\n"
+    "Generate one image (wide 16:9 landscape) based on the first frame you just made.\n"
     "请基于你【刚刚生成的首帧图】,生成对应的【尾帧图】一张(横屏 16:9)。\n\n"
     "【硬性要求】\n"
     "1. ⭐ 本次【只要 1 张图】,不要生成两张拼接图\n"
@@ -211,13 +272,28 @@ DEFAULT_END_PEOPLE_TMPL = (
     "3. ✅ 人物特征必须与首帧及参考图一致(脸型/服装/发型不得改)\n"
     "4. ❌ 不要换场景(比如一张街景一张室内)\n"
     "5. ❌ 不要出现日文/韩文招牌文字\n\n"
-    "【⚠️ 首尾帧差异硬性要求(Wan 2.2 插值必需)】\n"
-    "首尾肉眼必须能看出不同。以下两轴至少命中一轴,最好都有:\n"
-    "  ① 相机运动:推/拉/摇/俯仰 任选一(如需静止机位,请明确在 prompt 里写)\n"
-    "  ② 人物动作/表情变化:按描述里的动作轴(抬头/握拳/转身/视线移动),\n"
-    "     首尾图是该动作的【起点】和【终点】,而不是两个几乎相同的瞬间\n\n"
+    "【Preserve list — 不要漂移(official edit pattern)】\n"
+    "  ✅ Preserve identity: face, facial features, skin tone,\n"
+    "     body shape, hairstyle, exact likeness from first frame.\n"
+    "  ✅ Preserve photography style: photorealistic candid, 35mm film,\n"
+    "     50mm lens, same grain density, same lighting direction.\n"
+    "  ✅ Preserve scene: camera angle, framing, background objects.\n"
+    "  ✅ Same photographer, next moment — like the next shutter click.\n\n"
+    "【⚠️ Change list — 首尾帧差异(Wan 2.2 插值必需)】\n"
+    "Meet at least ONE of these two axes, both is better:\n"
+    "  ① Camera motion: dolly / push / pull / pan / tilt\n"
+    "     — specify direction AND amount (e.g. slight push-in ~15cm)\n"
+    "     — 若需保持静止机位,明确写 'camera locked, no motion'\n"
+    "  ② Subject action/expression: first frame and last frame should be\n"
+    "     the 【start】 and 【end】 points of a single action arc\n"
+    "     (head-down → head-up, fist-relaxed → fist-clenched, etc.)\n"
+    "     — not two near-identical moments.\n\n"
     "⛔ 禁用词(会导致 Wan 2.2 插值无运动):\n"
-    "  「同一机位同一构图」「只有细微变化」「几乎相同」「基本不变」"
+    "  「同一机位同一构图」「只有细微变化」「几乎相同」「基本不变」\n\n"
+    "【Constraints】\n"
+    "  ❌ No glamorization.\n"
+    "  ❌ No heavy retouching, no plastic skin, no over-sharpening.\n"
+    "  ❌ No watermark, no extra text, no logos."
 )
 
 # OpenAI 兼容 API 默认配置(支持中转和自建站)
