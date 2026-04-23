@@ -3,6 +3,18 @@
 """
 ComfyUI Wan 2.2 首尾帧批量生成工具(GUI 版)
 ===========================================
+v0.10 更新日志:
+  - 🔧 修复:空镜 / 人物镜头首尾帧「PPT 感」问题 — 改写硬性要求模板
+    · 旧模板里尾帧还写着「同一机位同一构图」「只有细微变化」,GPT 画双胞胎导致 Wan 2.2 插值无运动
+    · 新模板要求首尾必须命中差异(空镜 3 轴 2 命中、人物镜头 2 轴 1 命中)
+    · 明确禁用词:同一机位、同一构图、略、稍微、基本不变、几乎相同
+  - 🆕 新增:⬜ 空镜模板 按钮 — AI 助手栏新增,可在 GUI 里编辑 4 个首尾帧模板
+    · 首帧·空镜 / 首帧·人物 / 尾帧·空镜 / 尾帧·人物 分 4 个 tab
+    · 支持恢复默认、保存到 config.json,下次启动自动加载
+  - 🆕 新增:📥 GPT 图目录 输入框 — 彻底干掉每次批量生图的弹窗
+    · 填好后记忆到 config.json,下次不再弹窗直接用
+    · 留空才会弹窗(保留旧行为做兜底)
+
 v0.9 更新日志:
   - 修复:📂 配置文件/素材库/预设文件 路径改为脚本所在目录(SCRIPT_DIR),
     从任何工作目录启动都能正确读取配置
@@ -79,7 +91,7 @@ v0.1 更新日志:
 运行:python comfy_wan22_gui.py
 """
 
-__version__ = "0.9"
+__version__ = "0.10"
 
 import os
 import sys
@@ -132,6 +144,73 @@ POLL_INTERVAL = 3
 TIMEOUT_SECS = 3600
 CLIENT_ID = str(uuid.uuid4())
 CONFIG_FILE = str(SCRIPT_DIR / "wan22_gui_config.json")
+
+# ============== v0.10 首尾帧硬性要求模板(4 个)==============
+# 架构沿用 v0.8+ 的两次请求模式:先首帧(A)再尾帧(B)
+# 病根在 B 请求的尾帧模板 — 以前写着「同一机位同一构图、只有细微变化」
+# 导致 GPT 画双胞胎,Wan 2.2 首尾插值计算无位移 → PPT 感
+# 把两张图的差异要求写到尾帧模板里,而不是硬要求「几乎相同」
+
+DEFAULT_START_EMPTY_TMPL = (
+    "━━━━━━━━━━━━━━━━━━━━━━━\n"
+    "请根据以上描述,生成【首帧图】一张(横屏 16:9)。\n\n"
+    "【⚠️ 这是纯环境空镜,硬性要求】\n"
+    "1. ⭐ 本次【只要 1 张图】,不要生成两张拼接图\n"
+    "2. ❌❌❌ 画面中绝对不得出现任何人物、剪影、背影、手、脸或人影 ❌❌❌\n"
+    "3. 只拍建筑、街道、天空、云层、水面、雨幕、室内陈设、物品等环境元素\n"
+    "4. ❌ 不要添加描述里【没有提到】的建筑、文字招牌、道具\n"
+    "5. ❌ 不要出现日文/韩文招牌文字,故事背景是中国都市\n"
+    "6. 📐 构图请预留视觉变化空间(主体不要填满画面,给尾帧相机运动留位置)"
+)
+
+DEFAULT_START_PEOPLE_TMPL = (
+    "━━━━━━━━━━━━━━━━━━━━━━━\n"
+    "请根据以上描述,生成【首帧图】一张(横屏 16:9)。\n\n"
+    "【硬性要求】\n"
+    "1. ⭐ 本次【只要 1 张图】,不要生成两张拼接图,也不要首尾帧并排\n"
+    "2. ❌ 不要添加描述里【没有提到】的人物、道具、建筑、文字招牌\n"
+    "3. ❌ 不要出现日文/韩文招牌文字,故事背景是中国都市\n"
+    "4. ✅ 上传的参考图是角色/道具的外观参考,必须严格遵循其外貌特征\n"
+    "5. ✅ 这张图用于后续尾帧的构图基准,需场景/人物特征清晰可辨\n"
+    "6. 📐 构图请预留动作变化空间(给尾帧里人物动作或相机运动留余地)"
+)
+
+DEFAULT_END_EMPTY_TMPL = (
+    "━━━━━━━━━━━━━━━━━━━━━━━\n"
+    "请基于你【刚刚生成的首帧图】,生成对应的【尾帧图】一张(横屏 16:9)。\n\n"
+    "【⚠️ 这是纯环境空镜,硬性要求】\n"
+    "1. ⭐ 本次【只要 1 张图】,不要生成两张拼接图\n"
+    "2. ❌❌❌ 画面中仍然绝对不得出现任何人物、剪影、背影、手、脸或人影 ❌❌❌\n"
+    "3. ✅ 保持首帧的场景空间、建筑位置、物体摆放不变(是同一个地方的下一瞬间)\n"
+    "4. ❌ 不要添加首帧【没有出现】的建筑、文字招牌、道具\n"
+    "5. ❌ 不要出现日文/韩文招牌文字\n\n"
+    "【⚠️ 首尾帧差异硬性要求(Wan 2.2 插值必需)】\n"
+    "首尾放一起对比,必须一眼看出不同。以下三轴至少命中两轴:\n"
+    "  ① 相机运动:推/拉/升/降/摇/俯冲 任选一,位移 ≥ 画宽 10%(写死方向,不写「略」)\n"
+    "  ② 天气/光线:雨势/光强/云层/雾气 给出明确的「起始→终末」变化\n"
+    "  ③ 动态元素:水涟漪扩大、光斑扩散、霓虹闪烁、树叶风动、云影位移 至少一个\n\n"
+    "⛔ 禁用词(出现任一就等于没动):\n"
+    "  「同一机位」「同一构图」「同一角度」「只有细微变化」「几乎相同」「基本不变」\n\n"
+    "🔍 生成前自检:首尾放一起,能一眼看出相机动了/天气变了吗?不能就增强差异。"
+)
+
+DEFAULT_END_PEOPLE_TMPL = (
+    "━━━━━━━━━━━━━━━━━━━━━━━\n"
+    "请基于你【刚刚生成的首帧图】,生成对应的【尾帧图】一张(横屏 16:9)。\n\n"
+    "【硬性要求】\n"
+    "1. ⭐ 本次【只要 1 张图】,不要生成两张拼接图\n"
+    "2. ✅ 保持首帧的场景、色调、人物造型、服装完全一致(是同一瞬间的下一帧)\n"
+    "3. ✅ 人物特征必须与首帧及参考图一致(脸型/服装/发型不得改)\n"
+    "4. ❌ 不要换场景(比如一张街景一张室内)\n"
+    "5. ❌ 不要出现日文/韩文招牌文字\n\n"
+    "【⚠️ 首尾帧差异硬性要求(Wan 2.2 插值必需)】\n"
+    "首尾肉眼必须能看出不同。以下两轴至少命中一轴,最好都有:\n"
+    "  ① 相机运动:推/拉/摇/俯仰 任选一(如需静止机位,请明确在 prompt 里写)\n"
+    "  ② 人物动作/表情变化:按描述里的动作轴(抬头/握拳/转身/视线移动),\n"
+    "     首尾图是该动作的【起点】和【终点】,而不是两个几乎相同的瞬间\n\n"
+    "⛔ 禁用词(会导致 Wan 2.2 插值无运动):\n"
+    "  「同一机位同一构图」「只有细微变化」「几乎相同」「基本不变」"
+)
 
 # OpenAI 兼容 API 默认配置(支持中转和自建站)
 DEFAULT_OPENAI_BASE = "https://api.openai.com/v1"
@@ -1576,6 +1655,13 @@ class ComfyBatchGUI:
         self.color_anchors = ColorAnchors(log_cb=self._log)
         self.auto_inject_color_var = tk.BooleanVar(value=True)  # 发送时自动注入色板
 
+        # v0.10:GPT 图保存目录(填了就不弹窗) + 4 个首尾帧模板
+        self.gpt_save_dir_var = tk.StringVar(value=str(SCRIPT_DIR / "gpt_images"))
+        self._tmpl_start_empty = DEFAULT_START_EMPTY_TMPL
+        self._tmpl_start_people = DEFAULT_START_PEOPLE_TMPL
+        self._tmpl_end_empty = DEFAULT_END_EMPTY_TMPL
+        self._tmpl_end_people = DEFAULT_END_PEOPLE_TMPL
+
         # 手动提示词库(GPT 和 Wan 2.2 各一份)
         self._prompt_presets = []  # [{"title":"...", "text":"..."}]
         self._wan22_presets = []   # [{"title":"...", "text":"..."}]
@@ -1679,10 +1765,12 @@ class ComfyBatchGUI:
                    command=self._ai_gen_prompts).grid(row=0, column=7, padx=2)
         ttk.Button(ai_row, text="🎨 色彩锚点",
                    command=self._show_color_anchors_dialog).grid(row=0, column=8, padx=2)
+        ttk.Button(ai_row, text="⬜ 空镜模板",
+                   command=self._show_frame_tmpl_dialog).grid(row=0, column=9, padx=2)
         ttk.Button(ai_row, text="📝 GPT 提示词库",
-                   command=self._show_gpt_preset_dialog).grid(row=0, column=9, padx=2)
+                   command=self._show_gpt_preset_dialog).grid(row=0, column=10, padx=2)
         ttk.Button(ai_row, text="🧪 测试 API",
-                   command=self._test_ai_api).grid(row=0, column=10, padx=2)
+                   command=self._test_ai_api).grid(row=0, column=11, padx=2)
 
         # GPT 网页控制(放到第 3 行,避免第 1 行挤爆显示不全)
         ttk.Label(ai_row, text="🌐 GPT 网页地址:").grid(row=3, column=0, sticky="w", pady=(4, 0))
@@ -1749,6 +1837,21 @@ class ComfyBatchGUI:
                   text="💡 把参考图放进素材库目录,文件名就是关键字(如「林默.png」)。AI 对话会自动匹配上传。",
                   foreground="#2277aa", font=("Microsoft YaHei", 8)).grid(
             row=5, column=0, columnspan=13, sticky="w", pady=(2, 0))
+
+        # v0.10:GPT 图保存目录(填了就不弹窗)
+        ttk.Label(ai_row, text="📥 GPT 图目录:",
+                  font=("Microsoft YaHei", 9, "bold")).grid(row=6, column=0, sticky="w", pady=(6, 0))
+        ttk.Entry(ai_row, textvariable=self.gpt_save_dir_var, width=56).grid(
+            row=6, column=1, columnspan=6, sticky="we", pady=(6, 0))
+        ttk.Button(ai_row, text="浏览", width=6,
+                   command=self._pick_gpt_save_dir).grid(row=6, column=7, padx=2, pady=(6, 0))
+        ttk.Button(ai_row, text="📂 打开", width=10,
+                   command=lambda: self._open_file(self.gpt_save_dir_var.get())
+                   ).grid(row=6, column=8, padx=2, pady=(6, 0))
+        ttk.Label(ai_row,
+                  text="💡 批量生图会直接存到这里,不再每次弹窗。留空才会弹窗。",
+                  foreground="#2277aa", font=("Microsoft YaHei", 8)).grid(
+            row=7, column=0, columnspan=13, sticky="w", pady=(2, 0))
 
         # 中部:左任务表 + 右提示原则
         mid = ttk.Frame(self.root)
@@ -1870,6 +1973,12 @@ class ComfyBatchGUI:
             self.asset_dir_var.set(c.get("asset_dir", self.asset_dir_var.get()))
             self.auto_upload_var.set(c.get("auto_upload", True))
             self.auto_inject_color_var.set(c.get("auto_inject_color", True))
+            # v0.10:GPT 图保存目录 + 4 个首尾帧模板
+            self.gpt_save_dir_var.set(c.get("gpt_save_dir", self.gpt_save_dir_var.get()))
+            self._tmpl_start_empty = c.get("tmpl_start_empty", DEFAULT_START_EMPTY_TMPL)
+            self._tmpl_start_people = c.get("tmpl_start_people", DEFAULT_START_PEOPLE_TMPL)
+            self._tmpl_end_empty = c.get("tmpl_end_empty", DEFAULT_END_EMPTY_TMPL)
+            self._tmpl_end_people = c.get("tmpl_end_people", DEFAULT_END_PEOPLE_TMPL)
             # 自动扫素材库一次
             d = self.asset_dir_var.get()
             if d and Path(d).exists():
@@ -1914,6 +2023,12 @@ class ComfyBatchGUI:
             "asset_dir": self.asset_dir_var.get(),
             "auto_upload": self.auto_upload_var.get(),
             "auto_inject_color": self.auto_inject_color_var.get(),
+            # v0.10:GPT 图保存目录 + 4 个首尾帧模板
+            "gpt_save_dir": self.gpt_save_dir_var.get(),
+            "tmpl_start_empty": self._tmpl_start_empty,
+            "tmpl_start_people": self._tmpl_start_people,
+            "tmpl_end_empty": self._tmpl_end_empty,
+            "tmpl_end_people": self._tmpl_end_people,
             "scenes": self.scenes,
         }
         try:
@@ -2892,6 +3007,14 @@ class ComfyBatchGUI:
             self.asset_dir_var.set(p)
             self._rescan_assets()
 
+    def _pick_gpt_save_dir(self):
+        """v0.10:选 GPT 图保存目录,选完记忆到 config.json"""
+        cur = self.gpt_save_dir_var.get().strip() or str(SCRIPT_DIR)
+        p = filedialog.askdirectory(title="选择 GPT 图保存目录", initialdir=cur)
+        if p:
+            self.gpt_save_dir_var.set(p)
+            self._log(f"📥 GPT 图保存目录已设为:{p}")
+
     def _rescan_assets(self):
         """扫描素材库目录,建立索引"""
         d = self.asset_dir_var.get().strip()
@@ -3059,12 +3182,22 @@ class ComfyBatchGUI:
                 "GPT 网页未挂载,请先点「🌐 打开 GPT」并确保登录。")
             return
         s = self.scenes[idx]
-        default_dir = str(SCRIPT_DIR / "gpt_images")
-        save_dir = filedialog.askdirectory(
-            title=f"选择保存目录(场景: {s['name']})",
-            initialdir=default_dir)
-        if not save_dir:
-            return
+        # v0.10:优先用记忆目录,填了就不弹窗
+        save_dir = self.gpt_save_dir_var.get().strip()
+        if save_dir:
+            try:
+                Path(save_dir).mkdir(parents=True, exist_ok=True)
+            except Exception as e:
+                messagebox.showerror("错误", f"GPT 图保存目录无法创建:\n{save_dir}\n\n{e}")
+                return
+        else:
+            default_dir = str(SCRIPT_DIR / "gpt_images")
+            save_dir = filedialog.askdirectory(
+                title=f"选择保存目录(场景: {s['name']})",
+                initialdir=default_dir)
+            if not save_dir:
+                return
+            self.gpt_save_dir_var.set(save_dir)
 
         self.stop_flag.clear()
         self.gpt_pause_flag.clear()
@@ -3624,6 +3757,89 @@ class ComfyBatchGUI:
         bar.pack(fill="x", padx=8, pady=8)
         ttk.Button(bar, text="保存", command=save).pack(side="left", padx=4)
         ttk.Button(bar, text="取消", command=dlg.destroy).pack(side="left", padx=4)
+
+    def _show_frame_tmpl_dialog(self):
+        """v0.10:4 个首尾帧硬性要求模板编辑器(2x2 tab)"""
+        dlg = tk.Toplevel(self.root)
+        dlg.title("⬜ 首尾帧硬性要求模板编辑")
+        dlg.geometry("920x740")
+        dlg.transient(self.root)
+
+        ttk.Label(dlg,
+                  text="💡 批量 / 单独 GPT 生图时,两次调用(首帧 + 尾帧)会各自注入一个模板。"
+                       "病根在「尾帧模板」里曾经的「同一机位同一构图」— 现在改成要求明确差异。",
+                  foreground="#2277aa", font=("Microsoft YaHei", 9),
+                  wraplength=880, justify="left").pack(fill="x", padx=8, pady=(8, 4))
+
+        nb = ttk.Notebook(dlg)
+        nb.pack(fill="both", expand=True, padx=8, pady=4)
+
+        widgets = {}
+
+        def add_tab(tab_title, hint, attr, default):
+            tab = ttk.Frame(nb)
+            nb.add(tab, text=tab_title)
+            ttk.Label(tab, text=hint, foreground="#444",
+                      font=("Microsoft YaHei", 8),
+                      wraplength=880, justify="left").pack(fill="x", padx=6, pady=(6, 2))
+            txt = scrolledtext.ScrolledText(tab, wrap="word",
+                                            font=("Microsoft YaHei", 10))
+            txt.pack(fill="both", expand=True, padx=6, pady=4)
+            txt.insert("1.0", getattr(self, attr))
+            widgets[attr] = (txt, default)
+            return tab
+
+        add_tab("🎬 首帧·空镜",
+                "适用:01/02/11/14/15/24/28 等无人物场景的首帧请求。",
+                "_tmpl_start_empty", DEFAULT_START_EMPTY_TMPL)
+        add_tab("👤 首帧·人物",
+                "适用:有林默/林渊/苏郁等角色的场景首帧请求。",
+                "_tmpl_start_people", DEFAULT_START_PEOPLE_TMPL)
+        add_tab("🎬 尾帧·空镜 ⚠️病根",
+                "⚠️ 这个模板是 PPT 感的主要病根 — 以前写「同一机位同一构图」,"
+                "现在改成要求 3 轴差异(相机/光线/动态元素)至少命中 2 轴。",
+                "_tmpl_end_empty", DEFAULT_END_EMPTY_TMPL)
+        add_tab("👤 尾帧·人物 ⚠️病根",
+                "⚠️ 人物镜头尾帧也不能锁死「同一角度」— 现在允许相机运动 + 动作变化。",
+                "_tmpl_end_people", DEFAULT_END_PEOPLE_TMPL)
+
+        def save():
+            for attr, (txt, _) in widgets.items():
+                setattr(self, attr, txt.get("1.0", "end").rstrip())
+            self._save_config()
+            self._log("✅ 4 个首尾帧模板已保存")
+            messagebox.showinfo("已保存",
+                                "4 个模板已保存到 config.json,下次启动自动加载。\n\n"
+                                "下次批量 / 单独 GPT 生图时会自动使用新模板。",
+                                parent=dlg)
+
+        def restore_current():
+            """只恢复当前 tab"""
+            cur_idx = nb.index(nb.select())
+            attr = list(widgets.keys())[cur_idx]
+            txt, default = widgets[attr]
+            if messagebox.askyesno("确认",
+                                   f"恢复当前 tab 模板为默认值?当前内容会丢失。",
+                                   parent=dlg):
+                txt.delete("1.0", "end")
+                txt.insert("1.0", default)
+
+        def restore_all():
+            if messagebox.askyesno("确认",
+                                   "4 个模板全部恢复默认值?所有当前改动会丢失。",
+                                   parent=dlg):
+                for attr, (txt, default) in widgets.items():
+                    txt.delete("1.0", "end")
+                    txt.insert("1.0", default)
+
+        bar = ttk.Frame(dlg)
+        bar.pack(fill="x", padx=8, pady=8)
+        ttk.Button(bar, text="💾 保存", command=save).pack(side="left", padx=4)
+        ttk.Button(bar, text="↺ 当前 tab 恢复默认",
+                   command=restore_current).pack(side="left", padx=4)
+        ttk.Button(bar, text="↺ 全部恢复默认",
+                   command=restore_all).pack(side="left", padx=4)
+        ttk.Button(bar, text="取消", command=dlg.destroy).pack(side="right", padx=4)
 
     def _show_gpt_preset_dialog(self):
         """GPT 提示词库独立窗口 — 不需要启动浏览器也能用"""
@@ -4516,13 +4732,25 @@ class ComfyBatchGUI:
             messagebox.showerror("错误",
                 "GPT 网页未挂载,请先点「🌐 打开 GPT」并确保登录。")
             return
-        # 目标保存目录
-        default_dir = str(SCRIPT_DIR / "gpt_images")
-        save_dir = filedialog.askdirectory(
-            title="选择 GPT 生成图片的保存目录",
-            initialdir=default_dir)
-        if not save_dir:
-            return
+        # v0.10:目标保存目录 — 优先用 gpt_save_dir_var 里记忆的路径,填了就不弹窗
+        save_dir = self.gpt_save_dir_var.get().strip()
+        if save_dir:
+            try:
+                Path(save_dir).mkdir(parents=True, exist_ok=True)
+                self._log(f"📥 使用记忆的 GPT 图保存目录:{save_dir}")
+            except Exception as e:
+                messagebox.showerror("错误", f"GPT 图保存目录无法创建:\n{save_dir}\n\n{e}")
+                return
+        else:
+            # 留空才弹窗(旧行为兜底)
+            default_dir = str(SCRIPT_DIR / "gpt_images")
+            save_dir = filedialog.askdirectory(
+                title="选择 GPT 图保存目录(填了 AI 助手栏的「📥 GPT 图目录」就不用每次选了)",
+                initialdir=default_dir)
+            if not save_dir:
+                return
+            self.gpt_save_dir_var.set(save_dir)
+            self._log(f"📥 已记忆 GPT 图保存目录,下次不再弹窗:{save_dir}")
         # 询问是否只处理缺图的场景
         missing_count = sum(1 for s in self.scenes
                             if not s.get("start") or not s.get("end"))
@@ -4565,67 +4793,20 @@ class ComfyBatchGUI:
     )
 
     def _build_start_frame_prompt(self, raw, has_people):
-        """v0.8 两次调用:第一次请求【只要一张首帧图】。
-
-        关键:明确告诉 GPT "只要 1 张,不是两张",因为单图请求
-        比两图请求稳定得多 — 之前观察到 GPT 经常把两帧合并成一张拼接图输出。
+        """v0.10:改为用可配置模板(self._tmpl_start_empty / _tmpl_start_people)。
+        两次调用架构的第一次请求 — 只要一张首帧图。
+        模板可在 AI 助手栏「⬜ 空镜模板」里编辑。
         """
-        if has_people:
-            tail = (
-                "━━━━━━━━━━━━━━━━━━━━━━━\n"
-                "请根据以上描述,生成【首帧图】一张(横屏 16:9)。\n\n"
-                "【硬性要求】\n"
-                "1. ⭐ 本次【只要 1 张图】,不要生成两张拼接图,也不要首尾帧并排\n"
-                "2. ❌ 不要添加描述里【没有提到】的人物、道具、建筑、文字招牌\n"
-                "3. ❌ 不要出现日文/韩文招牌文字,故事背景是中国都市\n"
-                "4. ✅ 上传的参考图是角色/道具的外观参考,必须严格遵循其外貌特征\n"
-                "5. ✅ 这张图用于后续尾帧的构图基准,需场景/人物特征清晰可辨"
-            )
-        else:
-            tail = (
-                "━━━━━━━━━━━━━━━━━━━━━━━\n"
-                "请根据以上描述,生成【首帧图】一张(横屏 16:9)。\n\n"
-                "【⚠️ 这是纯环境空镜,硬性要求】\n"
-                "1. ⭐ 本次【只要 1 张图】,不要生成两张拼接图\n"
-                "2. ❌❌❌ 画面中绝对不得出现任何人物、剪影、背影、手、脸或人影 ❌❌❌\n"
-                "3. 只拍建筑、街道、天空、云层、水面、雨幕、室内陈设、物品等环境元素\n"
-                "4. ❌ 不要添加描述里【没有提到】的建筑、文字招牌、道具\n"
-                "5. ❌ 不要出现日文/韩文招牌文字,故事背景是中国都市"
-            )
+        tail = self._tmpl_start_people if has_people else self._tmpl_start_empty
         return raw + "\n\n" + tail
 
     def _build_end_frame_prompt(self, raw, has_people):
-        """v0.8 两次调用:第二次请求【基于上一张生成尾帧】。
-
-        关键:强调"基于刚才那张首帧"、"同一场景同一机位",
-        GPT 会引用上下文中的首帧图像,生成动作延续一帧 → 最适合 Wan 2.2 插值。
+        """v0.10:改为用可配置模板(self._tmpl_end_empty / _tmpl_end_people)。
+        这里是 PPT 感的病根所在 — 新模板要求首尾帧必须有明确差异,
+        而不是「同一机位同一构图只有细微变化」。
+        模板可在 AI 助手栏「⬜ 空镜模板」里编辑。
         """
-        if has_people:
-            tail = (
-                "━━━━━━━━━━━━━━━━━━━━━━━\n"
-                "请基于你【刚刚生成的首帧图】,生成对应的【尾帧图】一张(横屏 16:9)。\n\n"
-                "【硬性要求】\n"
-                "1. ⭐ 本次【只要 1 张图】,不要生成两张拼接图\n"
-                "2. ⭐ 必须是【同一场景、同一镜头角度、同一机位】的延续瞬间,"
-                "只有主体细微的动作/表情/光线变化(用于制作首尾帧动画过渡)\n"
-                "3. ❌ 不要换场景(比如一张街景一张室内)\n"
-                "4. ❌ 不要换角度/机位/构图\n"
-                "5. ❌ 不要出现日文/韩文招牌文字\n"
-                "6. ✅ 保持画面风格、色调、人物造型、服装、场景细节与首帧【完全一致】\n"
-                "7. ✅ 人物特征必须与首帧及参考图一致(脸型/服装/发型不得改)"
-            )
-        else:
-            tail = (
-                "━━━━━━━━━━━━━━━━━━━━━━━\n"
-                "请基于你【刚刚生成的首帧图】,生成对应的【尾帧图】一张(横屏 16:9)。\n\n"
-                "【⚠️ 这是纯环境空镜,硬性要求】\n"
-                "1. ⭐ 本次【只要 1 张图】,不要生成两张拼接图\n"
-                "2. ❌❌❌ 画面中仍然绝对不得出现任何人物、剪影、背影、手、脸或人影 ❌❌❌\n"
-                "3. ⭐ 必须是【同一场景、同一角度、同一构图】,只有光线/气氛/镜头距离的细微变化\n"
-                "4. ❌ 不要添加首帧【没有出现】的建筑、文字招牌、道具\n"
-                "5. ❌ 不要出现日文/韩文招牌文字\n"
-                "6. ✅ 保持画面风格、色调、构图、场景细节与首帧【完全一致】"
-            )
+        tail = self._tmpl_end_people if has_people else self._tmpl_end_empty
         return raw + "\n\n" + tail
 
     def _request_single_gpt_image(self, gpt_text, timeout=300, stable_seconds=5):
