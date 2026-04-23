@@ -3,6 +3,14 @@
 """
 ComfyUI Wan 2.2 首尾帧批量生成工具(GUI 版)
 ===========================================
+v0.11 更新日志:
+  - 🆕 新增:🔄 每场景新开对话 — 批量 / 单独 GPT 生图时,每个场景画完首尾帧后
+    自动点 GPT 网页的「新聊天」按钮,开干净对话继续下一场景
+    · 目的:隔离上下文,避免长对话污染导致后续场景画风漂移 / 记错设定
+    · UI:素材库行右侧新增复选框,默认开启
+    · 多重选择器兜底(aria-label / data-testid / nav a[href="/"])
+    · 最后一个场景不新开(省一次点击)
+
 v0.10 更新日志:
   - 🔧 修复:空镜 / 人物镜头首尾帧「PPT 感」问题 — 改写硬性要求模板
     · 旧模板里尾帧还写着「同一机位同一构图」「只有细微变化」,GPT 画双胞胎导致 Wan 2.2 插值无运动
@@ -91,7 +99,7 @@ v0.1 更新日志:
 运行:python comfy_wan22_gui.py
 """
 
-__version__ = "0.10"
+__version__ = "0.11"
 
 import os
 import sys
@@ -1168,6 +1176,83 @@ class GPTWebController:
         except Exception:
             return False
 
+    def new_chat(self, wait_ready=True, timeout=10):
+        """v0.11:点 GPT 网页左上角「新聊天」按钮,开一个干净的新对话。
+        
+        用于批量生图时每个场景之间隔离上下文,避免上下文污染导致画风漂移。
+        
+        - wait_ready:点完是否等输入框出现(确认新对话已就绪)
+        - timeout:等输入框的最长秒数
+        
+        返回 True 成功 / False 失败(失败已打日志,调用者决定是否继续)
+        """
+        if not self.is_alive():
+            return False
+        d = self.driver
+        
+        # 多重选择器 — GPT 网页版本可能变,尽量兜底
+        # 1. aria-label 常见值:"新聊天" / "New chat" / "开启新聊天"
+        # 2. data-testid:"create-new-chat-button"(老版本)
+        # 3. 图标按钮:href="/" 的 a 标签
+        js = """
+        function findNewChatBtn() {
+            // 方案 1:aria-label 匹配
+            const labels = ['新聊天', 'New chat', '新建聊天', '开启新聊天', '새 채팅'];
+            for (const lab of labels) {
+                const el = document.querySelector(`[aria-label="${lab}" i]`);
+                if (el) return el;
+            }
+            // 方案 2:data-testid
+            const ids = ['create-new-chat-button', 'new-chat-button'];
+            for (const id of ids) {
+                const el = document.querySelector(`[data-testid="${id}"]`);
+                if (el) return el;
+            }
+            // 方案 3:侧边栏 href="/" 的链接(ChatGPT 本站 / 镜像站都适用)
+            const links = document.querySelectorAll('nav a[href="/"], aside a[href="/"]');
+            if (links.length > 0) return links[0];
+            // 方案 4:遍历按钮找带 plus 图标 + 文字包含"新"/"new"
+            const btns = document.querySelectorAll('button, a');
+            for (const b of btns) {
+                const txt = (b.textContent || '').trim().toLowerCase();
+                if (txt === '新聊天' || txt === 'new chat' || txt === '新建聊天') return b;
+            }
+            return null;
+        }
+        const btn = findNewChatBtn();
+        if (!btn) return 'NOT_FOUND';
+        btn.click();
+        return 'OK';
+        """
+        try:
+            r = d.execute_script(js)
+            if r != "OK":
+                self.log(f"   ⚠️ 新聊天按钮未找到(结果:{r}),跳过新开对话")
+                return False
+            self.log("   🔄 已点击新聊天按钮")
+        except Exception as e:
+            self.log(f"   ⚠️ 点击新聊天失败:{e}")
+            return False
+        
+        if wait_ready:
+            # 等输入框出现,确认页面已切到新对话
+            import time as _t
+            deadline = _t.time() + timeout
+            while _t.time() < deadline:
+                try:
+                    ready = d.execute_script(
+                        f"return !!document.querySelector('{self.INPUT_SELECTOR}');")
+                    if ready:
+                        self.log("   ✅ 新对话已就绪")
+                        _t.sleep(0.5)  # 让 DOM 完全稳定
+                        return True
+                except Exception:
+                    pass
+                _t.sleep(0.3)
+            self.log("   ⚠️ 等待新对话输入框超时(但可能已切换,继续)")
+            return True  # 宽容:按钮点到了就算成功
+        return True
+
     def send(self, text, wait_reply=True, timeout=180):
         """填入输入框,点发送,可选等回复完成"""
         if not self.is_alive():
@@ -1662,6 +1747,9 @@ class ComfyBatchGUI:
         self._tmpl_end_empty = DEFAULT_END_EMPTY_TMPL
         self._tmpl_end_people = DEFAULT_END_PEOPLE_TMPL
 
+        # v0.11:每场景完成后自动新开 GPT 对话(隔离上下文,避免画风漂移)
+        self.auto_new_chat_var = tk.BooleanVar(value=True)
+
         # 手动提示词库(GPT 和 Wan 2.2 各一份)
         self._prompt_presets = []  # [{"title":"...", "text":"..."}]
         self._wan22_presets = []   # [{"title":"...", "text":"..."}]
@@ -1833,6 +1921,10 @@ class ComfyBatchGUI:
         ttk.Checkbutton(ai_row, text="🎨 自动注入色板",
                         variable=self.auto_inject_color_var).grid(
             row=4, column=12, columnspan=3, sticky="w", padx=(4, 0), pady=(6, 0))
+        # v0.11:每场景后自动新开对话
+        ttk.Checkbutton(ai_row, text="🔄 每场景新开对话",
+                        variable=self.auto_new_chat_var).grid(
+            row=4, column=15, columnspan=3, sticky="w", padx=(4, 0), pady=(6, 0))
         ttk.Label(ai_row,
                   text="💡 把参考图放进素材库目录,文件名就是关键字(如「林默.png」)。AI 对话会自动匹配上传。",
                   foreground="#2277aa", font=("Microsoft YaHei", 8)).grid(
@@ -1979,6 +2071,8 @@ class ComfyBatchGUI:
             self._tmpl_start_people = c.get("tmpl_start_people", DEFAULT_START_PEOPLE_TMPL)
             self._tmpl_end_empty = c.get("tmpl_end_empty", DEFAULT_END_EMPTY_TMPL)
             self._tmpl_end_people = c.get("tmpl_end_people", DEFAULT_END_PEOPLE_TMPL)
+            # v0.11:自动新开对话开关
+            self.auto_new_chat_var.set(c.get("auto_new_chat", True))
             # 自动扫素材库一次
             d = self.asset_dir_var.get()
             if d and Path(d).exists():
@@ -2029,6 +2123,8 @@ class ComfyBatchGUI:
             "tmpl_start_people": self._tmpl_start_people,
             "tmpl_end_empty": self._tmpl_end_empty,
             "tmpl_end_people": self._tmpl_end_people,
+            # v0.11
+            "auto_new_chat": self.auto_new_chat_var.get(),
             "scenes": self.scenes,
         }
         try:
@@ -3284,6 +3380,12 @@ class ComfyBatchGUI:
             self.scenes[idx] = s
             self.root.after(0, self._refresh_tree)
             self._log(f"   🎉 单独 GPT 生图完成: {s['name']}")
+            # v0.11:单独生图也自动新开对话,保持行为一致
+            if self.auto_new_chat_var.get():
+                try:
+                    self.gpt_ctrl.new_chat(wait_ready=True, timeout=10)
+                except Exception as e:
+                    self._log(f"   ⚠️ 新开对话失败:{e}")
             self._save_config()
         except Exception as e:
             self._log(f"   ❌ 失败: {e}")
@@ -4976,6 +5078,15 @@ class ComfyBatchGUI:
                 # v0.9: 更新进度条
                 self.progress["value"] = i + 1
                 self.progress_label.config(text=f"{i+1} / {total}")
+
+                # v0.11: 每个场景完成后自动新开 GPT 对话,隔离上下文避免画风漂移
+                # 最后一个场景不用新开(省一次点击)
+                if self.auto_new_chat_var.get() and i < total - 1:
+                    self._log(f"   🔄 [自动] 开新对话(隔离上下文)")
+                    try:
+                        self.gpt_ctrl.new_chat(wait_ready=True, timeout=10)
+                    except Exception as e:
+                        self._log(f"   ⚠️ 新开对话失败(继续用旧对话):{e}")
 
                 # 礼貌性间隔,避免被 GPT 限速
                 time.sleep(3)
