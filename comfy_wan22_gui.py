@@ -3,6 +3,19 @@
 """
 ComfyUI Wan 2.2 首尾帧批量生成工具(GUI 版)
 ===========================================
+v0.9 更新日志:
+  - 修复:📂 配置文件/素材库/预设文件 路径改为脚本所在目录(SCRIPT_DIR),
+    从任何工作目录启动都能正确读取配置
+  - 修复:🔍 素材库自动匹配角色图 — 导入 CSV 后自动扫描素材库,
+    根据 prompt 中的角色名匹配参考图并在日志中显示结果
+  - 新增:📁 素材库递归扫描 — 支持子文件夹内的图片,不再只读根目录
+  - 新增:⏸ 批量 GPT 生图支持暂停/继续 — 新增「暂停」「继续」按钮
+  - 新增:🎯 单独 GPT 生图 — 右键菜单可对选中场景单独生成首尾帧
+  - 新增:▶ 单独生成视频 — 右键菜单可对选中场景单独提交 ComfyUI 生成
+  - 新增:🔍 自动匹配素材按钮 — 批量检查所有场景的角色匹配情况
+  - 优化:GPT 批量生图增加进度条显示
+  - 优化:导入 CSV 后自动触发素材匹配检查
+
 v0.8 更新日志:
   - 改进:🖼 批量 GPT 生图 — 拆成「两次请求」流程,提高出图成功率
     · 原流程:一次发送 prompt,要求 GPT 同时生成首帧 + 尾帧(共 2 张)
@@ -66,7 +79,7 @@ v0.1 更新日志:
 运行:python comfy_wan22_gui.py
 """
 
-__version__ = "0.8"
+__version__ = "0.9"
 
 import os
 import sys
@@ -109,13 +122,16 @@ except ImportError:
     pass
 
 
+# ============== 脚本目录(所有相对路径基于此,不依赖 CWD) ==============
+SCRIPT_DIR = Path(__file__).resolve().parent
+
 # ============== 默认配置 ==============
 DEFAULT_HOST = "127.0.0.1:8188"
-DEFAULT_OUTPUT_DIR = str(Path.cwd() / "videos_output")
+DEFAULT_OUTPUT_DIR = str(SCRIPT_DIR / "videos_output")
 POLL_INTERVAL = 3
 TIMEOUT_SECS = 3600
 CLIENT_ID = str(uuid.uuid4())
-CONFIG_FILE = "wan22_gui_config.json"
+CONFIG_FILE = str(SCRIPT_DIR / "wan22_gui_config.json")
 
 # OpenAI 兼容 API 默认配置(支持中转和自建站)
 DEFAULT_OPENAI_BASE = "https://api.openai.com/v1"
@@ -524,14 +540,13 @@ class AssetLibrary:
         self.rescan()
 
     def rescan(self):
-        """扫描目录,重建索引"""
+        """扫描目录(含子目录),重建索引"""
         self._index.clear()
         self._aliases.clear()
         if not self.root_dir or not self.root_dir.exists():
             return 0
-        # 读别名
-        alias_file = self.root_dir / "aliases.json"
-        if alias_file.exists():
+        # 读别名(根目录和子目录都扫)
+        for alias_file in self.root_dir.rglob("aliases.json"):
             try:
                 with open(alias_file, "r", encoding="utf-8") as f:
                     data = json.load(f)
@@ -539,12 +554,14 @@ class AssetLibrary:
                     for a in (alist if isinstance(alist, list) else [alist]):
                         self._aliases[a] = main
             except Exception as e:
-                self.log(f"⚠️ 读 aliases.json 失败: {e}")
-        # 扫图
-        for f in self.root_dir.iterdir():
+                self.log(f"⚠️ 读 {alias_file} 失败: {e}")
+        # 递归扫图(子文件夹也扫)
+        for f in self.root_dir.rglob("*"):
             if f.is_file() and f.suffix.lower() in self.EXT_IMG:
                 key = f.stem  # 不含扩展名
-                self._index[key] = str(f.resolve())
+                # 如果有同名,优先根目录的
+                if key not in self._index:
+                    self._index[key] = str(f.resolve())
         return len(self._index)
 
     def list_all(self):
@@ -1551,7 +1568,7 @@ class ComfyBatchGUI:
         self.gpt_chrome_path_var = tk.StringVar()  # 空则自动探测
 
         # 素材库
-        self.asset_dir_var = tk.StringVar(value=str(Path.cwd() / "assets_library"))
+        self.asset_dir_var = tk.StringVar(value=str(SCRIPT_DIR / "assets_library"))
         self.asset_lib = AssetLibrary(log_cb=self._log)
         self.auto_upload_var = tk.BooleanVar(value=True)  # 发送前自动上传匹配图片
 
@@ -1562,9 +1579,13 @@ class ComfyBatchGUI:
         # 手动提示词库(GPT 和 Wan 2.2 各一份)
         self._prompt_presets = []  # [{"title":"...", "text":"..."}]
         self._wan22_presets = []   # [{"title":"...", "text":"..."}]
-        self._prompt_presets_file = str(Path.cwd() / "gpt_prompts.json")
-        self._wan22_presets_file = str(Path.cwd() / "wan22_prompts.json")
+        self._prompt_presets_file = str(SCRIPT_DIR / "gpt_prompts.json")
+        self._wan22_presets_file = str(SCRIPT_DIR / "wan22_prompts.json")
         self.gpt_ctrl = None  # GPTWebController 实例
+
+        # v0.9: GPT 批量生图暂停/继续
+        self.gpt_pause_flag = threading.Event()   # set = 暂停中
+        self.gpt_batch_running = False             # 标记 GPT 批量是否在跑
 
         self._build_ui()
         self._enable_drag_drop()
@@ -1748,6 +1769,14 @@ class ComfyBatchGUI:
         ttk.Button(btn_bar, text="💾 导出 CSV", command=self._export_csv).pack(side="left", padx=2)
         ttk.Button(btn_bar, text="🖼 批量 GPT 生图",
                    command=self._start_batch_gpt_images).pack(side="left", padx=2)
+        ttk.Button(btn_bar, text="🔍 自动匹配素材",
+                   command=self._auto_match_assets_to_scenes).pack(side="left", padx=2)
+        self.gpt_pause_btn = ttk.Button(btn_bar, text="⏸ 暂停生图",
+                                         command=self._toggle_gpt_pause, state="disabled")
+        self.gpt_pause_btn.pack(side="left", padx=2)
+        self.gpt_stop_btn = ttk.Button(btn_bar, text="⏹ 停止生图",
+                                        command=self._stop_batch_gpt, state="disabled")
+        self.gpt_stop_btn.pack(side="left", padx=2)
         ttk.Button(btn_bar, text="🗑 清空", command=self._clear_scenes).pack(side="left", padx=2)
         ttk.Button(btn_bar, text="🔄 重置状态", command=self._reset_status).pack(side="left", padx=2)
         ttk.Button(btn_bar, text="📖 Wan 提示词库",
@@ -1807,9 +1836,14 @@ class ComfyBatchGUI:
 
     # ---------- 配置持久化 ----------
     def _load_last_config(self):
+        # v0.9: 先找 SCRIPT_DIR 下的配置,再 fallback 到 CWD(兼容旧版)
         p = Path(CONFIG_FILE)
         if not p.exists():
-            return
+            cwd_config = Path.cwd() / "wan22_gui_config.json"
+            if cwd_config.exists():
+                p = cwd_config
+            else:
+                return
         try:
             with open(p, "r", encoding="utf-8") as f:
                 c = json.load(f)
@@ -2190,6 +2224,12 @@ class ComfyBatchGUI:
                 menu.add_command(label="📁 在文件夹中显示",
                                  command=lambda: self._reveal_file(s["video_path"]))
             menu.add_separator()
+            # v0.9: 单独操作
+            menu.add_command(label="🖼 单独 GPT 生图(此场景)",
+                             command=lambda: self._single_gpt_image(idx))
+            menu.add_command(label="▶ 单独生成视频(此场景)",
+                             command=lambda: self._single_batch(idx))
+            menu.add_separator()
             menu.add_command(label="❌ 删除", command=self._delete_scene)
         menu.add_command(label="➕ 添加场景", command=self._add_scene)
         menu.post(event.x_root, event.y_root)
@@ -2515,6 +2555,8 @@ class ComfyBatchGUI:
                     cnt += 1
             self._refresh_tree()
             self._log(f"📥 从 {p} 导入 {cnt} 条")
+            # v0.9: 导入后自动匹配素材库
+            self._auto_match_assets_to_scenes(silent=True)
         except Exception as e:
             messagebox.showerror("导入失败", str(e))
 
@@ -2964,6 +3006,258 @@ class ComfyBatchGUI:
             "格式:\n"
             '{\n  "正式名": ["别名1", "别名2"],\n  ...\n}\n\n'
             "编辑保存后回来点「🔄 扫描」生效。")
+
+    # ---------- v0.9: 自动匹配素材到场景 ----------
+    def _auto_match_assets_to_scenes(self, silent=False):
+        """扫描素材库,对所有场景的 prompt 做角色匹配并在日志中显示结果"""
+        # 确保素材库已扫描
+        if not self.asset_lib._index:
+            d = self.asset_dir_var.get().strip()
+            if d and Path(d).exists():
+                self.asset_lib.set_root(d)
+        if not self.asset_lib._index:
+            if not silent:
+                messagebox.showinfo("提示",
+                    "素材库为空或未设置。\n请先在「素材库」处选择目录并放入角色参考图。")
+            return
+        if not self.scenes:
+            if not silent:
+                messagebox.showinfo("提示", "任务列表为空,请先导入 CSV 或添加场景。")
+            return
+
+        total_matched = 0
+        total_scenes = len(self.scenes)
+        self._log(f"\n🔍 开始自动匹配素材(共 {total_scenes} 个场景,"
+                  f"素材库 {len(self.asset_lib._index)} 张图)")
+        for i, s in enumerate(self.scenes):
+            raw = (s.get("gpt_prompt") or "").strip() or (s.get("prompt") or "").strip()
+            if not raw:
+                continue
+            matched = self.asset_lib.match(raw)
+            if matched:
+                total_matched += 1
+                names = ", ".join(k for k, _ in matched)
+                self._log(f"   ✅ [{i+1}] {s['name']} → 匹配: {names}")
+            else:
+                self._log(f"   ⬜ [{i+1}] {s['name']} → 无匹配")
+
+        self._log(f"🔍 匹配完成:{total_matched}/{total_scenes} 个场景有角色匹配")
+        if not silent:
+            messagebox.showinfo("匹配结果",
+                f"匹配完成!\n\n"
+                f"有角色匹配的场景:{total_matched} / {total_scenes}\n"
+                f"素材库图片数:{len(self.asset_lib._index)}\n\n"
+                f"详情请查看日志窗口。")
+
+    # ---------- v0.9: 单独 GPT 生图(选中场景) ----------
+    def _single_gpt_image(self, idx):
+        """对单个场景执行 GPT 生图(右键菜单调用)"""
+        if not (0 <= idx < len(self.scenes)):
+            return
+        if not self.gpt_ctrl or not self.gpt_ctrl.is_alive():
+            messagebox.showerror("错误",
+                "GPT 网页未挂载,请先点「🌐 打开 GPT」并确保登录。")
+            return
+        s = self.scenes[idx]
+        default_dir = str(SCRIPT_DIR / "gpt_images")
+        save_dir = filedialog.askdirectory(
+            title=f"选择保存目录(场景: {s['name']})",
+            initialdir=default_dir)
+        if not save_dir:
+            return
+
+        self.stop_flag.clear()
+        self.gpt_pause_flag.clear()
+        self.gpt_batch_running = True
+        self._update_gpt_batch_buttons()
+
+        def _worker():
+            try:
+                self._run_single_gpt_scene(idx, save_dir)
+            finally:
+                self.gpt_batch_running = False
+                self.root.after(0, self._update_gpt_batch_buttons)
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _run_single_gpt_scene(self, idx, save_dir):
+        """GPT 生图单场景逻辑(可被批量和单独调用共享)"""
+        s = self.scenes[idx]
+        self._log(f"\n🎨 [单独] {s['name']}")
+        try:
+            raw = (s.get("gpt_prompt") or "").strip() or (s.get("prompt") or "").strip()
+            if not raw:
+                self._log("   ⚠️ 无 prompt,跳过")
+                return
+
+            # 注入色板
+            cid = s.get("color", "")
+            if cid and self.auto_inject_color_var.get():
+                raw = self.color_anchors.inject(raw, cid)
+                self._log(f"   🎨 已注入色板:{self.color_anchors.get_name(cid)}")
+
+            has_people = any(kw in raw for kw in self._PEOPLE_KEYWORDS)
+            self._log(f"   🧭 prompt 模式:{'人物镜头' if has_people else '纯环境空镜'}")
+
+            # 素材库匹配上传
+            matched = self.asset_lib.match(raw) if self.asset_lib._index else []
+            ref_paths = [p for _, p in matched]
+            if ref_paths and self.auto_upload_var.get():
+                self._log(f"   📎 匹配到 {len(ref_paths)} 张参考图:"
+                          f"{', '.join(k for k, _ in matched)}")
+                try:
+                    self.gpt_ctrl.upload_files(ref_paths)
+                    time.sleep(1.5)
+                except Exception as e:
+                    self._log(f"   ⚠️ 参考图上传失败(继续发送):{e}")
+
+            sub = Path(save_dir) / f"{idx+1:02d}_{s['name']}"
+
+            # 首帧
+            self._log(f"   📤 [阶段 1/2] 请求首帧图...")
+            start_prompt = self._build_start_frame_prompt(raw, has_people)
+            start_urls, _ = self._request_single_gpt_image(start_prompt, timeout=300)
+            if not start_urls:
+                self._log("   ❌ 首帧超时")
+                return
+            start_saved = self.gpt_ctrl.download_last_images(str(sub), urls=start_urls[:1])
+            if not start_saved:
+                self._log("   ❌ 首帧下载失败")
+                return
+            start_path = start_saved[0]
+            self._log(f"   ✅ 首帧已保存: {start_path}")
+
+            time.sleep(2)
+
+            # 尾帧
+            self._log(f"   📤 [阶段 2/2] 请求尾帧图...")
+            end_prompt = self._build_end_frame_prompt(raw, has_people)
+            end_urls, _ = self._request_single_gpt_image(end_prompt, timeout=300)
+            if not end_urls:
+                self._log("   ⚠️ 尾帧超时,回退为用首帧作为尾帧")
+                end_path = start_path
+            else:
+                end_saved = self.gpt_ctrl.download_last_images(str(sub), urls=end_urls[:1])
+                if not end_saved:
+                    self._log("   ⚠️ 尾帧下载失败,回退用首帧")
+                    end_path = start_path
+                else:
+                    end_path = end_saved[0]
+                    self._log(f"   ✅ 尾帧已保存: {end_path}")
+
+            # 回填
+            s["start"] = start_path
+            s["end"] = end_path
+            self.scenes[idx] = s
+            self.root.after(0, self._refresh_tree)
+            self._log(f"   🎉 单独 GPT 生图完成: {s['name']}")
+            self._save_config()
+        except Exception as e:
+            self._log(f"   ❌ 失败: {e}")
+
+    # ---------- v0.9: 单独生成视频(选中场景) ----------
+    def _single_batch(self, idx):
+        """对单个场景执行 ComfyUI 视频生成(右键菜单调用)"""
+        if not (0 <= idx < len(self.scenes)):
+            return
+        if not self.workflow:
+            messagebox.showerror("错误", "请先选择并加载工作流 JSON")
+            return
+        s = self.scenes[idx]
+        if not s.get("start") or not s.get("end"):
+            messagebox.showerror("错误", f"场景「{s['name']}」缺少首帧或尾帧图片")
+            return
+        if not (self.start_node_var.get() and self.end_node_var.get() and self.prompt_node_var.get()):
+            messagebox.showerror("错误", "请先完成节点配置(点「扫描节点」)")
+            return
+
+        self._save_config()
+        self.run_btn.config(state="disabled")
+        self.stop_btn.config(state="normal")
+        self.stop_flag.clear()
+        self.progress["maximum"] = 1
+        self.progress["value"] = 0
+
+        def _worker():
+            host = self.host_var.get()
+            out_dir = self.output_var.get()
+            sn = self.start_node_var.get()
+            en = self.end_node_var.get()
+            pn = self.prompt_node_var.get()
+            pf = self.prompt_field_var.get()
+
+            self._log(f"\n🎬 [单独] {s['name']}")
+            self._update_status(idx, "处理中...")
+            try:
+                self._log(f"   📤 上传首帧: {Path(s['start']).name}")
+                start_name = upload_image(host, s["start"])
+                self._log(f"   📤 上传尾帧: {Path(s['end']).name}")
+                end_name = upload_image(host, s["end"])
+
+                final_prompt = s["prompt"]
+                cid = s.get("color", "")
+                if cid and self.auto_inject_color_var.get():
+                    final_prompt = self.color_anchors.inject(final_prompt, cid)
+
+                wf = patch_workflow(self.workflow, sn, en, pn, pf,
+                                    start_name, end_name, final_prompt,
+                                    width=self.width_var.get(),
+                                    height=self.height_var.get(),
+                                    length=self.length_var.get())
+                pid = queue_prompt(host, wf)
+                self._log(f"   📮 已排队 prompt_id={pid[:8]}...")
+                h = wait_done(host, pid, log_cb=self._log)
+                videos = find_output_videos(h)
+                if not videos:
+                    self._log("   ⚠️ 无视频输出")
+                    self._update_status(idx, "❌ 无输出")
+                else:
+                    for v in videos:
+                        ext = Path(v["filename"]).suffix or ".mp4"
+                        target_name = f"{s['name']}{ext}"
+                        path = download_output(host, v, out_dir, rename_to=target_name)
+                        self._log(f"   ✅ 保存: {path}")
+                        self.scenes[idx]["video_path"] = str(path)
+                    self._update_status(idx, "✅ 完成")
+            except Exception as e:
+                self._log(f"   ❌ 失败: {e}")
+                self._update_status(idx, "❌ 失败")
+
+            self.progress["value"] = 1
+            self.progress_label.config(text="1 / 1")
+            self._log(f"🎉 单独生成完成: {s['name']}")
+            self.run_btn.config(state="normal")
+            self.stop_btn.config(state="disabled")
+            self._save_config()
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    # ---------- v0.9: GPT 批量生图暂停/继续/停止控制 ----------
+    def _toggle_gpt_pause(self):
+        """暂停 / 继续 GPT 批量生图"""
+        if self.gpt_pause_flag.is_set():
+            self.gpt_pause_flag.clear()
+            self._log("▶ 继续 GPT 批量生图")
+            self.gpt_pause_btn.config(text="⏸ 暂停生图")
+        else:
+            self.gpt_pause_flag.set()
+            self._log("⏸ 已暂停,完成当前场景后暂停")
+            self.gpt_pause_btn.config(text="▶ 继续生图")
+
+    def _stop_batch_gpt(self):
+        """停止 GPT 批量生图"""
+        self.stop_flag.set()
+        self.gpt_pause_flag.clear()  # 如果暂停中也要能停止
+        self._log("⏹ 收到停止信号,将在当前场景后停止")
+
+    def _update_gpt_batch_buttons(self):
+        """根据 gpt_batch_running 状态更新按钮"""
+        if self.gpt_batch_running:
+            self.gpt_pause_btn.config(state="normal")
+            self.gpt_stop_btn.config(state="normal")
+        else:
+            self.gpt_pause_btn.config(state="disabled", text="⏸ 暂停生图")
+            self.gpt_stop_btn.config(state="disabled")
 
     # ---------- 色彩锚点管理对话框 ----------
     def _show_color_anchors_dialog(self):
@@ -4223,7 +4517,7 @@ class ComfyBatchGUI:
                 "GPT 网页未挂载,请先点「🌐 打开 GPT」并确保登录。")
             return
         # 目标保存目录
-        default_dir = str(Path.cwd() / "gpt_images")
+        default_dir = str(SCRIPT_DIR / "gpt_images")
         save_dir = filedialog.askdirectory(
             title="选择 GPT 生成图片的保存目录",
             initialdir=default_dir)
@@ -4245,6 +4539,14 @@ class ComfyBatchGUI:
             only_missing = r
 
         self.stop_flag.clear()
+        self.gpt_pause_flag.clear()
+        self.gpt_batch_running = True
+        self._update_gpt_batch_buttons()
+        # v0.9: 设置进度条
+        self.progress["maximum"] = len(self.scenes)
+        self.progress["value"] = 0
+        self.progress_label.config(text=f"0 / {len(self.scenes)}")
+
         self.worker = threading.Thread(
             target=self._batch_gpt_images,
             args=(save_dir, only_missing),
@@ -4370,13 +4672,22 @@ class ComfyBatchGUI:
 
         total = len(self.scenes)
         done = 0
-        self._log(f"\n🖼 开始批量 GPT 生图 v0.8 两次调用模式"
+        self._log(f"\n🖼 开始批量 GPT 生图 v0.9 两次调用模式"
                   f"(共 {total} 个场景,目标目录:{save_dir})")
 
         for i, s in enumerate(self.scenes):
             if self.stop_flag.is_set():
                 self._log("⏹ 已停止")
                 break
+            # v0.9: 暂停检查
+            while self.gpt_pause_flag.is_set():
+                if self.stop_flag.is_set():
+                    break
+                time.sleep(0.5)
+            if self.stop_flag.is_set():
+                self._log("⏹ 已停止")
+                break
+
             if only_missing and s.get("start") and s.get("end"):
                 continue
 
@@ -4434,12 +4745,17 @@ class ComfyBatchGUI:
                 time.sleep(2)
                 if self.stop_flag.is_set():
                     self._log("⏹ 已停止(首帧完成后)")
-                    # 至少首帧已经存下,回填 start
                     if not only_missing or not s.get("start"):
                         s["start"] = start_path
                     self.scenes[i] = s
                     self.root.after(0, self._refresh_tree)
                     break
+
+                # v0.9: 暂停检查(首帧完成后)
+                while self.gpt_pause_flag.is_set():
+                    if self.stop_flag.is_set():
+                        break
+                    time.sleep(0.5)
 
                 # ─── 5. 第二次请求:基于首帧生成尾帧 ───
                 self._log(f"   📤 [阶段 2/2] 请求尾帧图(基于首帧延续一帧)...")
@@ -4447,7 +4763,7 @@ class ComfyBatchGUI:
                 end_urls, _ = self._request_single_gpt_image(
                     end_prompt, timeout=300, stable_seconds=5)
                 if not end_urls:
-                    # 尾帧失败不是致命 — 首帧已经成功,把首帧同时当尾帧回填(Wan 2.2 可以跑静态帧)
+                    # 尾帧失败不是致命 — 首帧已经成功
                     self._log("   ⚠️ 尾帧超时,回退为用首帧作为尾帧(可手动替换)")
                     end_path = start_path
                 else:
@@ -4476,6 +4792,10 @@ class ComfyBatchGUI:
                 self.root.after(0, self._refresh_tree)
                 done += 1
 
+                # v0.9: 更新进度条
+                self.progress["value"] = i + 1
+                self.progress_label.config(text=f"{i+1} / {total}")
+
                 # 礼貌性间隔,避免被 GPT 限速
                 time.sleep(3)
 
@@ -4483,6 +4803,8 @@ class ComfyBatchGUI:
                 self._log(f"   ❌ 失败: {e}")
 
         self._log(f"\n🎉 批量 GPT 生图完成!成功 {done} 个")
+        self.gpt_batch_running = False
+        self.root.after(0, self._update_gpt_batch_buttons)
         self._save_config()
 
 
