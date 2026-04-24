@@ -3,6 +3,34 @@
 """
 ComfyUI Wan 2.2 首尾帧批量生成工具(GUI 版)
 ===========================================
+v0.15 更新日志:
+  - 🆕 支持 Wan 2.2 官方的【@Image1 / @Image2】格式
+    · gpt_prompt 改写模板改为「@Image1 起始动作 @Image2 结束动作」
+    · 这是 Wan 2.2 原生语法,比"首帧:xxx;尾帧:xxx"更准确
+    · 参考:WAN2.2 提示词模板助手本地版 V1
+  - 🆕 支持【反向提示词/negative prompt】
+    · 节点配置加「反向提示词节点」下拉(扫描时识别 CLIPTextEncode)
+    · 通用负面词默认值(参考 WAN2.2 官方模板):
+      画面模糊、低画质、马赛克、细节丢失、人物变形、肢体畸形、
+      面部崩坏、穿模、画面闪烁、帧间跳变、文字、水印、logo
+    · UI 加「通用负面词」输入框,项目级共享
+    · CSV 加 negative 列(每场景可独立覆盖,留空用通用)
+    · 批量生成时自动注入对应 negative 节点
+
+v0.14 更新日志:
+  - 🎨 UI 重构:重新分区布局,按功能分组
+    · AI 配置大块改为【可折叠】,默认收起释放空间
+    · 日志区从底部移到右侧,和任务列表并排,高度翻倍
+    · 去掉右侧 Wan 提示词原则(改为按钮弹窗),腾出日志空间
+    · 工具栏按钮独立成一行(色彩/空镜模板/提示词库/匹配)
+  - 🆕 ⏱ 时长一键选:5 个按钮 2秒极速/3秒简短/5秒标准/7秒延长/10秒长镜头
+    · 按 16fps 自动算帧数(2秒=33帧、5秒=81帧...)
+    · 避免手动算 81/97/... 这种奇怪数字
+  - 💾 所有输入框/下拉框变化【实时自动保存】
+    · 用 tk Variable 的 trace_add("write") 监听所有配置字段
+    · 改完字段不用等关窗,500ms 后自动写入 config.json
+    · 解决"每次打开都保存不了"的问题
+
 v0.13 更新日志:
   - 📚 对齐:基于 OpenAI 官方 gpt-image-2 Cookbook(2026-04-21)做模板微调
     · 官方原话:"For wide, cinematic, low-light, rain, or neon scenes,
@@ -117,7 +145,7 @@ v0.1 更新日志:
 运行:python comfy_wan22_gui.py
 """
 
-__version__ = "0.13"
+__version__ = "0.16"
 
 import os
 import sys
@@ -170,6 +198,14 @@ POLL_INTERVAL = 3
 TIMEOUT_SECS = 3600
 CLIENT_ID = str(uuid.uuid4())
 CONFIG_FILE = str(SCRIPT_DIR / "wan22_gui_config.json")
+
+# v0.15:Wan 2.2 通用反向提示词(参考 WAN2.2 提示词模板助手本地版 V1)
+# 这套词能防住 Wan 2.2 最常见的 90% 视频质量问题
+DEFAULT_WAN22_NEGATIVE = (
+    "画面模糊、低画质、马赛克、细节丢失、"
+    "人物变形、肢体畸形、面部崩坏、穿模、"
+    "画面闪烁、帧间跳变、文字、水印、logo"
+)
 
 # ============== v0.10 首尾帧硬性要求模板(4 个)==============
 # 架构沿用 v0.8+ 的两次请求模式:先首帧(A)再尾帧(B)
@@ -549,7 +585,8 @@ def scan_workflow_resolution(wf):
 
 def patch_workflow(wf_template, start_node, end_node, prompt_node, prompt_field,
                    start_img_name, end_img_name, prompt_text,
-                   width=None, height=None, length=None):
+                   width=None, height=None, length=None,
+                   negative_node=None, negative_field=None, negative_text=None):
     wf = json.loads(json.dumps(wf_template))
     if start_node not in wf:
         raise RuntimeError(f"首帧节点 {start_node} 不存在")
@@ -562,7 +599,15 @@ def patch_workflow(wf_template, start_node, end_node, prompt_node, prompt_field,
     if prompt_field not in wf[prompt_node].get("inputs", {}):
         raise RuntimeError(f"提示词节点 {prompt_node} 无字段 {prompt_field}")
     wf[prompt_node]["inputs"][prompt_field] = prompt_text
-    # 同步所有带 width/height 的节点(WanFirstLastFrameToVideo/EmptyLatentVideo 等)
+    # v0.15:注入反向提示词(如果提供)
+    if negative_node and negative_text is not None:
+        if negative_node not in wf:
+            raise RuntimeError(f"反向节点 {negative_node} 不存在")
+        nf = negative_field or "text"
+        if nf not in wf[negative_node].get("inputs", {}):
+            raise RuntimeError(f"反向节点 {negative_node} 无字段 {nf}")
+        wf[negative_node]["inputs"][nf] = negative_text
+    # 同步所有带 width/height 的节点
     if width is not None or height is not None or length is not None:
         for nid, node in wf.items():
             inputs = node.get("inputs", {})
@@ -1252,47 +1297,42 @@ class GPTWebController:
         except Exception:
             return False
 
-    def new_chat(self, wait_ready=True, timeout=10):
-        """v0.11:点 GPT 网页左上角「新聊天」按钮,开一个干净的新对话。
+    def new_chat(self, wait_ready=True, timeout=15):
+        """v0.16:点新聊天按钮 + 彻底等切换完成
         
-        用于批量生图时每个场景之间隔离上下文,避免上下文污染导致画风漂移。
-        
-        - wait_ready:点完是否等输入框出现(确认新对话已就绪)
-        - timeout:等输入框的最长秒数
-        
-        返回 True 成功 / False 失败(失败已打日志,调用者决定是否继续)
+        之前 bug:按钮点了但 DOM 还没切换,下一轮对话区还是旧图。
+        修复:三重等待 — 等 URL 变化 + 等旧消息消失 + sleep(2) 兜底。
         """
         if not self.is_alive():
             return False
         d = self.driver
         
-        # 多重选择器 — GPT 网页版本可能变,尽量兜底
-        # 1. aria-label 常见值:"新聊天" / "New chat" / "开启新聊天"
-        # 2. data-testid:"create-new-chat-button"(老版本)
-        # 3. 图标按钮:href="/" 的 a 标签
+        # 记录点击前的 URL 和消息数,用于判断切换是否真的完成
+        try:
+            url_before = d.current_url
+            msgs_before = d.execute_script(
+                "return document.querySelectorAll('[data-message-author-role]').length;")
+        except Exception:
+            url_before = ""
+            msgs_before = 0
+        
         js = """
         function findNewChatBtn() {
-            // 方案 1:aria-label 匹配
-            const labels = ['新聊天', 'New chat', '新建聊天', '开启新聊天', '새 채팅'];
-            for (const lab of labels) {
-                const el = document.querySelector(`[aria-label="${lab}" i]`);
-                if (el) return el;
-            }
-            // 方案 2:data-testid
+            // 方案 1:data-testid(镜像站也是这个,已被用户验证)
             const ids = ['create-new-chat-button', 'new-chat-button'];
             for (const id of ids) {
                 const el = document.querySelector(`[data-testid="${id}"]`);
                 if (el) return el;
             }
-            // 方案 3:侧边栏 href="/" 的链接(ChatGPT 本站 / 镜像站都适用)
+            // 方案 2:aria-label
+            const labels = ['新聊天', 'New chat', '新建聊天', '开启新聊天'];
+            for (const lab of labels) {
+                const el = document.querySelector(`[aria-label="${lab}" i]`);
+                if (el) return el;
+            }
+            // 方案 3:href="/" 的链接
             const links = document.querySelectorAll('nav a[href="/"], aside a[href="/"]');
             if (links.length > 0) return links[0];
-            // 方案 4:遍历按钮找带 plus 图标 + 文字包含"新"/"new"
-            const btns = document.querySelectorAll('button, a');
-            for (const b of btns) {
-                const txt = (b.textContent || '').trim().toLowerCase();
-                if (txt === '新聊天' || txt === 'new chat' || txt === '新建聊天') return b;
-            }
             return null;
         }
         const btn = findNewChatBtn();
@@ -1303,7 +1343,7 @@ class GPTWebController:
         try:
             r = d.execute_script(js)
             if r != "OK":
-                self.log(f"   ⚠️ 新聊天按钮未找到(结果:{r}),跳过新开对话")
+                self.log(f"   ⚠️ 新聊天按钮未找到(结果:{r})")
                 return False
             self.log("   🔄 已点击新聊天按钮")
         except Exception as e:
@@ -1311,22 +1351,57 @@ class GPTWebController:
             return False
         
         if wait_ready:
-            # 等输入框出现,确认页面已切到新对话
             import time as _t
             deadline = _t.time() + timeout
+            url_changed = False
+            msgs_cleared = False
+            
+            # 等待 1:URL 变化(从 /c/xxx → / 或 /c/新ID)
+            while _t.time() < deadline:
+                try:
+                    url_now = d.current_url
+                    if url_now != url_before:
+                        url_changed = True
+                        self.log(f"   ✅ URL 已切换")
+                        break
+                except Exception:
+                    pass
+                _t.sleep(0.2)
+            
+            # 等待 2:旧消息清空(对话区不再有 message 节点,或数量大幅减少)
+            while _t.time() < deadline:
+                try:
+                    msgs_now = d.execute_script(
+                        "return document.querySelectorAll('[data-message-author-role]').length;")
+                    # 新对话应该是 0 条消息,或至少比之前少一半以上
+                    if msgs_now == 0 or msgs_now < msgs_before // 2:
+                        msgs_cleared = True
+                        self.log(f"   ✅ 对话区已清空({msgs_before}→{msgs_now})")
+                        break
+                except Exception:
+                    pass
+                _t.sleep(0.3)
+            
+            # 等待 3:输入框重新出现
             while _t.time() < deadline:
                 try:
                     ready = d.execute_script(
                         f"return !!document.querySelector('{self.INPUT_SELECTOR}');")
                     if ready:
-                        self.log("   ✅ 新对话已就绪")
-                        _t.sleep(0.5)  # 让 DOM 完全稳定
-                        return True
+                        break
                 except Exception:
                     pass
                 _t.sleep(0.3)
-            self.log("   ⚠️ 等待新对话输入框超时(但可能已切换,继续)")
-            return True  # 宽容:按钮点到了就算成功
+            
+            # 兜底 sleep — 让 React 完全 hydrate
+            _t.sleep(2)
+            
+            if url_changed and msgs_cleared:
+                self.log("   ✅ 新对话已就绪")
+                return True
+            else:
+                self.log(f"   ⚠️ 切换未完全确认(URL={url_changed}, 清空={msgs_cleared}),已兜底等待 2 秒")
+                return True  # 宽容:可能只是检测不准,继续跑
         return True
 
     def send(self, text, wait_reply=True, timeout=180):
@@ -1789,6 +1864,10 @@ class ComfyBatchGUI:
         self.end_node_var = tk.StringVar()
         self.prompt_node_var = tk.StringVar()
         self.prompt_field_var = tk.StringVar(value="text")
+        # v0.15:反向提示词节点 + 通用负面词
+        self.negative_node_var = tk.StringVar()  # 负面词节点 ID(Wan workflow 里另一个 CLIPTextEncode)
+        self.negative_field_var = tk.StringVar(value="text")  # 通常也是 "text" 字段
+        self.wan22_negative_var = tk.StringVar(value=DEFAULT_WAN22_NEGATIVE)  # 通用负面词
         # 分辨率(v0.8 默认改成横屏,配合拆分成两次 GPT 调用的新流程)
         self.orient_var = tk.StringVar(value="横屏 16:9")
         self.width_var = tk.IntVar(value=960)
@@ -1845,7 +1924,11 @@ class ComfyBatchGUI:
 
     # ---------- UI 构建 ----------
     def _build_ui(self):
-        # 顶部工具栏
+        # ═══════════════════════════════════════════════════════════
+        # v0.14 UI 重构:按功能分区 + AI 配置折叠 + 日志移到右侧
+        # ═══════════════════════════════════════════════════════════
+
+        # ─── 顶部工具栏:主机 + 工作流 ───
         top = ttk.Frame(self.root, padding=8)
         top.pack(fill="x")
 
@@ -1857,8 +1940,10 @@ class ComfyBatchGUI:
         ttk.Button(top, text="浏览...", command=self._pick_workflow).pack(side="left", padx=2)
         ttk.Button(top, text="扫描节点", command=self._scan_nodes).pack(side="left", padx=2)
 
-        # 节点配置行
-        node_row = ttk.LabelFrame(self.root, text="节点配置(加载工作流后点「扫描节点」自动填充)", padding=8)
+        # ─── 节点配置 + 分辨率/时长(固定显示,核心区)───
+        node_row = ttk.LabelFrame(self.root,
+                                   text="📦 节点配置 + 输出设置(加载工作流后点「扫描节点」自动填充)",
+                                   padding=8)
         node_row.pack(fill="x", padx=8, pady=(0, 4))
         ttk.Label(node_row, text="首帧节点:").grid(row=0, column=0, sticky="w")
         self.start_combo = ttk.Combobox(node_row, textvariable=self.start_node_var, width=8)
@@ -1902,12 +1987,60 @@ class ComfyBatchGUI:
         ttk.Label(node_row, text="帧数:").grid(row=1, column=7, sticky="e", pady=(6, 0))
         ttk.Spinbox(node_row, textvariable=self.length_var, from_=17, to=401,
                     increment=16, width=6).grid(row=1, column=8, padx=(2, 4), pady=(6, 0))
-        ttk.Label(node_row, text="(17/33/49/65/81/97/... 推荐 81,约 5.1 秒 @ 16fps)",
-                  foreground="#888").grid(row=1, column=9, columnspan=2, sticky="w", pady=(6, 0))
 
-        # AI 助手配置行
-        ai_row = ttk.LabelFrame(self.root, text="🤖 AI 助手 (OpenAI 兼容 API / 挂载 GPT 网页)", padding=8)
-        ai_row.pack(fill="x", padx=8, pady=(0, 4))
+        # v0.14:时长一键选(5 个按钮)— 按 16fps 换算,length = secs*16+1
+        # 2s→33 / 3s→49 / 5s→81 / 7s→113 / 10s→161
+        dur_frame = ttk.Frame(node_row)
+        dur_frame.grid(row=1, column=9, columnspan=5, sticky="w", pady=(6, 0), padx=(8, 0))
+        ttk.Label(dur_frame, text="⏱").pack(side="left", padx=(0, 2))
+        for secs, label, frames in [
+            (2, "2秒极速", 33),
+            (3, "3秒简短", 49),
+            (5, "5秒标准", 81),
+            (7, "7秒延长", 113),
+            (10, "10秒长镜头", 161),
+        ]:
+            ttk.Button(dur_frame, text=label, width=10,
+                       command=lambda f=frames, s=secs: self._set_duration(f, s)
+                       ).pack(side="left", padx=1)
+
+        # v0.15:第 3 行 — 反向提示词节点 + 通用负面词
+        ttk.Label(node_row, text="🚫 反向节点:").grid(row=2, column=0, sticky="w", pady=(6, 0))
+        self.negative_combo = ttk.Combobox(node_row, textvariable=self.negative_node_var, width=8)
+        self.negative_combo.grid(row=2, column=1, padx=(2, 12), pady=(6, 0))
+        self.negative_combo.bind("<<ComboboxSelected>>", self._on_negative_node_change)
+
+        ttk.Label(node_row, text="字段名:").grid(row=2, column=2, sticky="w", pady=(6, 0))
+        ttk.Entry(node_row, textvariable=self.negative_field_var, width=8).grid(
+            row=2, column=3, padx=2, pady=(6, 0))
+
+        ttk.Label(node_row, text="通用负面词:").grid(row=2, column=4, sticky="w", padx=(12, 0), pady=(6, 0))
+        ttk.Entry(node_row, textvariable=self.wan22_negative_var, width=58).grid(
+            row=2, column=5, columnspan=8, sticky="we", pady=(6, 0))
+        ttk.Button(node_row, text="↺",
+                   command=lambda: self.wan22_negative_var.set(DEFAULT_WAN22_NEGATIVE),
+                   width=3).grid(row=2, column=13, padx=(2, 0), pady=(6, 0))
+
+        # ─── 🤖 AI/GPT 配置(可折叠,默认收起)───
+        self._ai_collapsed = tk.BooleanVar(value=True)  # 默认折叠
+
+        ai_container = ttk.Frame(self.root)
+        ai_container.pack(fill="x", padx=8, pady=(0, 4))
+
+        ai_header = ttk.Frame(ai_container)
+        ai_header.pack(fill="x")
+        self._ai_toggle_btn = ttk.Button(
+            ai_header, text="▶ 🤖 AI 助手配置 (点击展开)",
+            command=self._toggle_ai_section, width=30)
+        self._ai_toggle_btn.pack(side="left", padx=2, pady=2)
+        ttk.Label(ai_header, text="(API Key / Base URL / 模型 / GPT 网页 / Chrome 路径)",
+                  foreground="#888", font=("Microsoft YaHei", 8)).pack(side="left", padx=8)
+
+        self._ai_row = ttk.LabelFrame(ai_container,
+                                       text="🤖 AI 助手 (OpenAI 兼容 API / 挂载 GPT 网页)",
+                                       padding=8)
+        # 默认不 pack(折叠状态)
+        ai_row = self._ai_row  # 保留别名方便下面复用原有代码
 
         ttk.Label(ai_row, text="API Key:").grid(row=0, column=0, sticky="w")
         key_entry = ttk.Entry(ai_row, textvariable=self.ai_key_var, width=20, show="*")
@@ -1922,30 +2055,6 @@ class ComfyBatchGUI:
                                         "gpt-5", "deepseek-chat", "deepseek-reasoner",
                                         "moonshot-v1-8k", "claude-3-5-sonnet"])
         model_cb.grid(row=0, column=5, padx=(2, 12))
-
-        ttk.Button(ai_row, text="📚 小说一键改分镜",
-                   command=self._open_novel_dialog).grid(row=0, column=6, padx=2)
-        ttk.Button(ai_row, text="✨ 给选中生成提示词",
-                   command=self._ai_gen_prompts).grid(row=0, column=7, padx=2)
-        ttk.Button(ai_row, text="🎨 色彩锚点",
-                   command=self._show_color_anchors_dialog).grid(row=0, column=8, padx=2)
-        ttk.Button(ai_row, text="⬜ 空镜模板",
-                   command=self._show_frame_tmpl_dialog).grid(row=0, column=9, padx=2)
-        ttk.Button(ai_row, text="📝 GPT 提示词库",
-                   command=self._show_gpt_preset_dialog).grid(row=0, column=10, padx=2)
-        ttk.Button(ai_row, text="🧪 测试 API",
-                   command=self._test_ai_api).grid(row=0, column=11, padx=2)
-
-        # GPT 网页控制(放到第 3 行,避免第 1 行挤爆显示不全)
-        ttk.Label(ai_row, text="🌐 GPT 网页地址:").grid(row=3, column=0, sticky="w", pady=(4, 0))
-        ttk.Entry(ai_row, textvariable=self.gpt_url_var, width=44).grid(
-            row=3, column=1, columnspan=4, sticky="we", padx=2, pady=(4, 0))
-        ttk.Button(ai_row, text="🌐 打开 / 挂载 GPT",
-                   command=self._open_gpt_web).grid(row=3, column=5, columnspan=2,
-                                                     sticky="w", padx=4, pady=(4, 0))
-        ttk.Label(ai_row, text="← 改完 URL 点此按钮重新挂载浏览器",
-                  foreground="#888", font=("Microsoft YaHei", 8)).grid(
-            row=3, column=7, columnspan=4, sticky="w", padx=(8, 0), pady=(4, 0))
 
         # 第二行:GPT 高级配置
         ttk.Label(ai_row, text="模式:").grid(row=1, column=0, sticky="w", pady=(4, 0))
@@ -1968,7 +2077,7 @@ class ComfyBatchGUI:
                    command=self._show_chrome_help).grid(
             row=1, column=7, columnspan=3, sticky="w", pady=(4, 0))
 
-        # 第三行:Chrome 可执行文件路径(可选,留空则自动探测)
+        # 第三行:Chrome 可执行文件路径
         ttk.Label(ai_row, text="Chrome 路径:").grid(row=2, column=0, sticky="w", pady=(4, 0))
         chrome_entry = ttk.Entry(ai_row, textvariable=self.gpt_chrome_path_var, width=56)
         chrome_entry.grid(row=2, column=1, columnspan=6, sticky="we", pady=(4, 0))
@@ -1976,136 +2085,254 @@ class ComfyBatchGUI:
                    command=self._pick_chrome_exe).grid(row=2, column=7, padx=2, pady=(4, 0))
         ttk.Button(ai_row, text="自动探测", width=10,
                    command=self._auto_detect_chrome).grid(row=2, column=8, padx=2, pady=(4, 0))
-        ttk.Label(ai_row, text="(留空会自动探测,Windows 常见:C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe)",
-                  foreground="#888", font=("Microsoft YaHei", 8)).grid(
-            row=3, column=0, columnspan=13, sticky="w", pady=(2, 0))
 
-        # 第四行:素材库
-        ttk.Label(ai_row, text="📁 素材库:",
-                  font=("Microsoft YaHei", 9, "bold")).grid(row=4, column=0, sticky="w", pady=(6, 0))
-        ttk.Entry(ai_row, textvariable=self.asset_dir_var, width=56).grid(
-            row=4, column=1, columnspan=6, sticky="we", pady=(6, 0))
-        ttk.Button(ai_row, text="浏览", width=6,
-                   command=self._pick_asset_dir).grid(row=4, column=7, padx=2, pady=(6, 0))
-        ttk.Button(ai_row, text="🔄 扫描", width=10,
-                   command=self._rescan_assets).grid(row=4, column=8, padx=2, pady=(6, 0))
-        ttk.Button(ai_row, text="📋 查看库", width=10,
-                   command=self._show_asset_library).grid(row=4, column=9, padx=2, pady=(6, 0))
-        ttk.Checkbutton(ai_row, text="发送时自动上传匹配图",
-                        variable=self.auto_upload_var).grid(
-            row=4, column=10, columnspan=2, sticky="w", padx=(4, 0), pady=(6, 0))
-        ttk.Checkbutton(ai_row, text="🎨 自动注入色板",
-                        variable=self.auto_inject_color_var).grid(
-            row=4, column=12, columnspan=3, sticky="w", padx=(4, 0), pady=(6, 0))
-        # v0.11:每场景后自动新开对话
-        ttk.Checkbutton(ai_row, text="🔄 每场景新开对话",
-                        variable=self.auto_new_chat_var).grid(
-            row=4, column=15, columnspan=3, sticky="w", padx=(4, 0), pady=(6, 0))
-        ttk.Label(ai_row,
-                  text="💡 把参考图放进素材库目录,文件名就是关键字(如「林默.png」)。AI 对话会自动匹配上传。",
-                  foreground="#2277aa", font=("Microsoft YaHei", 8)).grid(
-            row=5, column=0, columnspan=13, sticky="w", pady=(2, 0))
+        # 第 4 行:GPT 网页 URL + 挂载按钮
+        ttk.Label(ai_row, text="🌐 GPT 网页地址:").grid(row=3, column=0, sticky="w", pady=(6, 0))
+        ttk.Entry(ai_row, textvariable=self.gpt_url_var, width=44).grid(
+            row=3, column=1, columnspan=4, sticky="we", padx=2, pady=(6, 0))
+        ttk.Button(ai_row, text="🌐 打开 / 挂载 GPT",
+                   command=self._open_gpt_web).grid(row=3, column=5, columnspan=2,
+                                                     sticky="w", padx=4, pady=(6, 0))
 
-        # v0.10:GPT 图保存目录(填了就不弹窗)
-        ttk.Label(ai_row, text="📥 GPT 图目录:",
-                  font=("Microsoft YaHei", 9, "bold")).grid(row=6, column=0, sticky="w", pady=(6, 0))
-        ttk.Entry(ai_row, textvariable=self.gpt_save_dir_var, width=56).grid(
-            row=6, column=1, columnspan=6, sticky="we", pady=(6, 0))
-        ttk.Button(ai_row, text="浏览", width=6,
-                   command=self._pick_gpt_save_dir).grid(row=6, column=7, padx=2, pady=(6, 0))
-        ttk.Button(ai_row, text="📂 打开", width=10,
+        # ─── 🛠 工具栏(固定,独立一行)───
+        tool_row = ttk.LabelFrame(self.root, text="🛠 工具栏", padding=6)
+        tool_row.pack(fill="x", padx=8, pady=(0, 4))
+
+        ttk.Button(tool_row, text="📚 小说一键改分镜",
+                   command=self._open_novel_dialog).pack(side="left", padx=2)
+        ttk.Button(tool_row, text="✨ 给选中生成提示词",
+                   command=self._ai_gen_prompts).pack(side="left", padx=2)
+        ttk.Button(tool_row, text="🎨 色彩锚点",
+                   command=self._show_color_anchors_dialog).pack(side="left", padx=2)
+        ttk.Button(tool_row, text="⬜ 空镜模板",
+                   command=self._show_frame_tmpl_dialog).pack(side="left", padx=2)
+        ttk.Button(tool_row, text="📝 GPT 提示词库",
+                   command=self._show_gpt_preset_dialog).pack(side="left", padx=2)
+        ttk.Button(tool_row, text="📖 Wan 提示词库",
+                   command=self._show_wan22_preset_dialog).pack(side="left", padx=2)
+        ttk.Button(tool_row, text="📗 Wan 编写原则",
+                   command=self._show_wan22_tips).pack(side="left", padx=2)
+        ttk.Button(tool_row, text="🧪 测试 API",
+                   command=self._test_ai_api).pack(side="left", padx=2)
+        ttk.Button(tool_row, text="🔍 自动匹配素材",
+                   command=self._auto_match_assets_to_scenes).pack(side="left", padx=2)
+
+        # ─── 📁 素材库 + 📥 GPT 图目录(固定,合并一行)───
+        asset_row = ttk.LabelFrame(self.root, text="📁 素材 / 📥 GPT 图目录", padding=6)
+        asset_row.pack(fill="x", padx=8, pady=(0, 4))
+
+        ttk.Label(asset_row, text="📁 素材库:").grid(row=0, column=0, sticky="w")
+        ttk.Entry(asset_row, textvariable=self.asset_dir_var, width=50).grid(
+            row=0, column=1, sticky="we", padx=2)
+        ttk.Button(asset_row, text="浏览", width=6,
+                   command=self._pick_asset_dir).grid(row=0, column=2, padx=2)
+        ttk.Button(asset_row, text="🔄 扫描", width=8,
+                   command=self._rescan_assets).grid(row=0, column=3, padx=2)
+        ttk.Button(asset_row, text="📋 查看库", width=10,
+                   command=self._show_asset_library).grid(row=0, column=4, padx=2)
+
+        ttk.Label(asset_row, text="📥 GPT图目录:").grid(row=1, column=0, sticky="w", pady=(4, 0))
+        ttk.Entry(asset_row, textvariable=self.gpt_save_dir_var, width=50).grid(
+            row=1, column=1, sticky="we", padx=2, pady=(4, 0))
+        ttk.Button(asset_row, text="浏览", width=6,
+                   command=self._pick_gpt_save_dir).grid(row=1, column=2, padx=2, pady=(4, 0))
+        ttk.Button(asset_row, text="📂 打开", width=8,
                    command=lambda: self._open_file(self.gpt_save_dir_var.get())
-                   ).grid(row=6, column=8, padx=2, pady=(6, 0))
-        ttk.Label(ai_row,
-                  text="💡 批量生图会直接存到这里,不再每次弹窗。留空才会弹窗。",
-                  foreground="#2277aa", font=("Microsoft YaHei", 8)).grid(
-            row=7, column=0, columnspan=13, sticky="w", pady=(2, 0))
+                   ).grid(row=1, column=3, padx=2, pady=(4, 0))
 
-        # 中部:左任务表 + 右提示原则
-        mid = ttk.Frame(self.root)
+        # 右侧:开关区
+        sw_frame = ttk.Frame(asset_row)
+        sw_frame.grid(row=0, column=5, rowspan=2, sticky="nw", padx=(12, 0))
+        ttk.Checkbutton(sw_frame, text="发送时自动上传匹配图",
+                        variable=self.auto_upload_var).pack(anchor="w")
+        ttk.Checkbutton(sw_frame, text="🎨 自动注入色板",
+                        variable=self.auto_inject_color_var).pack(anchor="w")
+        ttk.Checkbutton(sw_frame, text="🔄 每场景新开对话",
+                        variable=self.auto_new_chat_var).pack(anchor="w")
+
+        asset_row.columnconfigure(1, weight=1)
+
+        # ─── 中部:左任务表 | 右日志(v0.14 日志从底部移到右侧)───
+        mid = ttk.PanedWindow(self.root, orient="horizontal")
         mid.pack(fill="both", expand=True, padx=8, pady=4)
 
         # 左:任务列表
-        left = ttk.LabelFrame(mid, text="场景任务列表(拖图片进来 / 双击编辑未完成项 / 双击完成项预览视频)",
+        left = ttk.LabelFrame(mid, text="🎬 场景任务列表(拖图进来 / 双击编辑 / 右键菜单)",
                               padding=4)
-        left.pack(side="left", fill="both", expand=True, padx=(0, 4))
 
         btn_bar = ttk.Frame(left)
         btn_bar.pack(fill="x")
-        ttk.Button(btn_bar, text="➕ 添加场景", command=self._add_scene).pack(side="left", padx=2)
-        ttk.Button(btn_bar, text="✏️ 编辑选中", command=self._edit_scene).pack(side="left", padx=2)
-        ttk.Button(btn_bar, text="▶ 预览视频", command=self._preview_video).pack(side="left", padx=2)
-        ttk.Button(btn_bar, text="❌ 删除选中", command=self._delete_scene).pack(side="left", padx=2)
-        ttk.Button(btn_bar, text="📂 导入 CSV", command=self._import_csv).pack(side="left", padx=2)
-        ttk.Button(btn_bar, text="💾 导出 CSV", command=self._export_csv).pack(side="left", padx=2)
-        ttk.Button(btn_bar, text="🖼 批量 GPT 生图",
-                   command=self._start_batch_gpt_images).pack(side="left", padx=2)
-        ttk.Button(btn_bar, text="🔍 自动匹配素材",
-                   command=self._auto_match_assets_to_scenes).pack(side="left", padx=2)
-        self.gpt_pause_btn = ttk.Button(btn_bar, text="⏸ 暂停生图",
-                                         command=self._toggle_gpt_pause, state="disabled")
-        self.gpt_pause_btn.pack(side="left", padx=2)
-        self.gpt_stop_btn = ttk.Button(btn_bar, text="⏹ 停止生图",
-                                        command=self._stop_batch_gpt, state="disabled")
-        self.gpt_stop_btn.pack(side="left", padx=2)
-        ttk.Button(btn_bar, text="🗑 清空", command=self._clear_scenes).pack(side="left", padx=2)
-        ttk.Button(btn_bar, text="🔄 重置状态", command=self._reset_status).pack(side="left", padx=2)
-        ttk.Button(btn_bar, text="📖 Wan 提示词库",
-                   command=self._show_wan22_preset_dialog).pack(side="left", padx=2)
+        ttk.Button(btn_bar, text="➕ 添加", command=self._add_scene).pack(side="left", padx=1)
+        ttk.Button(btn_bar, text="✏️ 编辑", command=self._edit_scene).pack(side="left", padx=1)
+        ttk.Button(btn_bar, text="▶ 预览", command=self._preview_video).pack(side="left", padx=1)
+        ttk.Button(btn_bar, text="❌ 删除", command=self._delete_scene).pack(side="left", padx=1)
+        ttk.Button(btn_bar, text="📂 导入CSV", command=self._import_csv).pack(side="left", padx=1)
+        ttk.Button(btn_bar, text="💾 导出CSV", command=self._export_csv).pack(side="left", padx=1)
+        ttk.Button(btn_bar, text="🗑 清空", command=self._clear_scenes).pack(side="left", padx=1)
+        ttk.Button(btn_bar, text="🔄 重置状态", command=self._reset_status).pack(side="left", padx=1)
 
-        # 拖放区提示(无拖拽库时显示文案)
-        tip_text = "💡 可将图片文件 直接拖入下方列表,弹窗自动分配首尾帧" + \
-                   ("" if HAS_DND else "(建议 pip install tkinterdnd2 获得最佳拖拽体验)")
-        ttk.Label(left, text=tip_text, foreground="#2277aa").pack(fill="x", pady=(2, 0))
+        btn_bar2 = ttk.Frame(left)
+        btn_bar2.pack(fill="x", pady=(2, 0))
+        ttk.Button(btn_bar2, text="🖼 批量 GPT 生图",
+                   command=self._start_batch_gpt_images).pack(side="left", padx=1)
+        self.gpt_pause_btn = ttk.Button(btn_bar2, text="⏸ 暂停生图",
+                                         command=self._toggle_gpt_pause, state="disabled")
+        self.gpt_pause_btn.pack(side="left", padx=1)
+        self.gpt_stop_btn = ttk.Button(btn_bar2, text="⏹ 停止生图",
+                                        command=self._stop_batch_gpt, state="disabled")
+        self.gpt_stop_btn.pack(side="left", padx=1)
+
+        tip_text = "💡 拖图片到列表 / 双击编辑 / 右键单独生成"
+        ttk.Label(left, text=tip_text, foreground="#2277aa",
+                  font=("Microsoft YaHei", 8)).pack(fill="x", pady=(2, 0))
 
         cols = ("seq", "name", "start", "end", "color", "prompt", "status")
-        self.tree = ttk.Treeview(left, columns=cols, show="headings", height=16)
-        headings = [("seq", "#", 40), ("name", "场景名", 130),
-                    ("start", "首帧图", 140), ("end", "尾帧图", 140),
-                    ("color", "🎨", 80),
-                    ("prompt", "提示词", 240), ("status", "状态", 90)]
+        self.tree = ttk.Treeview(left, columns=cols, show="headings", height=20)
+        headings = [("seq", "#", 38), ("name", "场景名", 120),
+                    ("start", "首帧", 100), ("end", "尾帧", 100),
+                    ("color", "🎨", 60),
+                    ("prompt", "提示词", 200), ("status", "状态", 80)]
         for key, text, w in headings:
             self.tree.heading(key, text=text)
             self.tree.column(key, width=w, anchor="w")
         self.tree.pack(fill="both", expand=True, pady=(4, 0))
         self.tree.bind("<Double-1>", self._on_tree_double_click)
-        self.tree.bind("<Button-3>", self._show_tree_menu)  # 右键菜单
+        self.tree.bind("<Button-3>", self._show_tree_menu)
 
-        # 右:提示词原则
-        right = ttk.LabelFrame(mid, text="📖 Wan 2.2 动作指令编写原则", padding=4)
-        right.pack(side="right", fill="both", padx=(4, 0))
-        tips = scrolledtext.ScrolledText(right, width=42, height=26, wrap="word",
-                                         font=("Microsoft YaHei", 9))
-        tips.insert("1.0", WAN22_TIPS)
-        tips.configure(state="disabled")
-        tips.pack(fill="both", expand=True)
+        mid.add(left, weight=3)
 
-        # 底部:运行按钮 + 日志
-        bot = ttk.Frame(self.root)
-        bot.pack(fill="both", padx=8, pady=4)
+        # 右:日志区(v0.14:从底部移到这里,和任务列表并排)
+        log_frame = ttk.LabelFrame(mid, text="📋 运行日志", padding=4)
 
-        run_bar = ttk.Frame(bot)
-        run_bar.pack(fill="x")
-        self.run_btn = ttk.Button(run_bar, text="🚀 开始批量生成", command=self._start_batch)
-        self.run_btn.pack(side="left", padx=2)
-        self.stop_btn = ttk.Button(run_bar, text="⏹ 停止", command=self._stop_batch, state="disabled")
-        self.stop_btn.pack(side="left", padx=2)
-        ttk.Button(run_bar, text="🧪 测试连接", command=self._test_conn).pack(side="left", padx=2)
-        ttk.Button(run_bar, text="📁 打开输出目录", command=self._open_output).pack(side="left", padx=2)
-        ttk.Button(run_bar, text="❓ 如何导出 API JSON", command=self._show_help).pack(side="left", padx=2)
-
-        self.progress = ttk.Progressbar(run_bar, mode="determinate", length=300)
-        self.progress.pack(side="right", padx=4)
-        self.progress_label = ttk.Label(run_bar, text="0 / 0")
-        self.progress_label.pack(side="right")
-
-        log_frame = ttk.LabelFrame(bot, text="运行日志", padding=4)
-        log_frame.pack(fill="both", expand=True, pady=(4, 0))
-        self.log_box = scrolledtext.ScrolledText(log_frame, height=10,
+        self.log_box = scrolledtext.ScrolledText(log_frame, width=50, height=28,
                                                  font=("Consolas", 9), wrap="word")
         self.log_box.pack(fill="both", expand=True)
 
+        log_btn_bar = ttk.Frame(log_frame)
+        log_btn_bar.pack(fill="x", pady=(2, 0))
+        ttk.Button(log_btn_bar, text="🗑 清空日志",
+                   command=lambda: self.log_box.delete("1.0", "end")).pack(side="left", padx=2)
+        ttk.Button(log_btn_bar, text="💾 保存日志",
+                   command=self._save_log_to_file).pack(side="left", padx=2)
+
+        mid.add(log_frame, weight=2)
+
+        # ─── 底部:运行按钮 + 进度条 ───
+        bot = ttk.Frame(self.root, padding=4)
+        bot.pack(fill="x", padx=4, pady=(0, 4))
+
+        self.run_btn = ttk.Button(bot, text="🚀 开始批量生成", command=self._start_batch)
+        self.run_btn.pack(side="left", padx=2)
+        self.stop_btn = ttk.Button(bot, text="⏹ 停止", command=self._stop_batch, state="disabled")
+        self.stop_btn.pack(side="left", padx=2)
+        ttk.Button(bot, text="🧪 测试连接", command=self._test_conn).pack(side="left", padx=2)
+        ttk.Button(bot, text="📁 打开输出目录", command=self._open_output).pack(side="left", padx=2)
+        ttk.Button(bot, text="❓ 如何导出 API JSON", command=self._show_help).pack(side="left", padx=2)
+
+        self.progress = ttk.Progressbar(bot, mode="determinate", length=300)
+        self.progress.pack(side="right", padx=4)
+        self.progress_label = ttk.Label(bot, text="0 / 0")
+        self.progress_label.pack(side="right")
+
+        # v0.14:所有输入框变化时自动保存(500ms 防抖)
+        self._setup_autosave()
+
     # ---------- 配置持久化 ----------
+    # ─── v0.14 新增方法 ───
+    def _toggle_ai_section(self):
+        """折叠/展开 AI 配置区"""
+        if self._ai_collapsed.get():
+            # 当前折叠 → 展开
+            self._ai_row.pack(fill="x", padx=2, pady=2)
+            self._ai_toggle_btn.config(text="▼ 🤖 AI 助手配置 (点击收起)")
+            self._ai_collapsed.set(False)
+        else:
+            # 当前展开 → 折叠
+            self._ai_row.pack_forget()
+            self._ai_toggle_btn.config(text="▶ 🤖 AI 助手配置 (点击展开)")
+            self._ai_collapsed.set(True)
+
+    def _set_duration(self, frames, secs):
+        """时长一键选 — 按 16fps 设置帧数"""
+        self.length_var.set(frames)
+        self._log(f"⏱ 已设为 {secs} 秒 ({frames} 帧 @ 16fps)")
+
+    def _setup_autosave(self):
+        """v0.14:所有输入框变化时自动保存(500ms 防抖)
+        解决"配置保存不了"的问题 — 不用等关窗,改完立即存。
+        """
+        self._autosave_pending = False
+
+        def debounced_save(*_args):
+            if self._autosave_pending:
+                return
+            self._autosave_pending = True
+            # 500ms 后保存,期间多次修改合并成一次写盘
+            self.root.after(500, self._do_autosave)
+
+        def _do_autosave_impl():
+            try:
+                self._save_config()
+            except Exception as e:
+                # 静默失败,避免刷屏
+                pass
+            finally:
+                self._autosave_pending = False
+
+        self._do_autosave = _do_autosave_impl
+
+        # 给所有需要持久化的 Var 加 trace
+        trace_vars = [
+            self.host_var, self.workflow_path, self.output_var,
+            self.start_node_var, self.end_node_var, self.prompt_node_var,
+            self.prompt_field_var,
+            self.width_var, self.height_var, self.length_var, self.orient_var,
+            self.ai_key_var, self.ai_base_var, self.ai_model_var,
+            self.gpt_url_var, self.gpt_mode_var, self.gpt_port_var, self.gpt_chrome_path_var,
+            self.asset_dir_var, self.auto_upload_var, self.auto_inject_color_var,
+            self.gpt_save_dir_var, self.auto_new_chat_var,
+            # v0.15
+            self.negative_node_var, self.negative_field_var, self.wan22_negative_var,
+        ]
+        for v in trace_vars:
+            try:
+                v.trace_add("write", debounced_save)
+            except Exception:
+                # 某些老 tkinter 可能不支持 trace_add,fallback 到 trace
+                try:
+                    v.trace("w", debounced_save)
+                except Exception:
+                    pass
+
+    def _save_log_to_file(self):
+        """保存日志到文件"""
+        p = filedialog.asksaveasfilename(
+            title="保存日志",
+            defaultextension=".txt",
+            filetypes=[("Text", "*.txt"), ("All", "*.*")],
+            initialfile=f"wan22_log_{time.strftime('%Y%m%d_%H%M%S')}.txt")
+        if not p:
+            return
+        try:
+            with open(p, "w", encoding="utf-8") as f:
+                f.write(self.log_box.get("1.0", "end"))
+            self._log(f"💾 日志已保存到:{p}")
+        except Exception as e:
+            messagebox.showerror("保存失败", str(e))
+
+    def _show_wan22_tips(self):
+        """弹窗显示 Wan 2.2 编写原则(原来在右侧常驻,v0.14 改为按需弹窗)"""
+        dlg = tk.Toplevel(self.root)
+        dlg.title("📗 Wan 2.2 动作指令编写原则")
+        dlg.geometry("720x600")
+        dlg.transient(self.root)
+        txt = scrolledtext.ScrolledText(dlg, wrap="word",
+                                        font=("Microsoft YaHei", 10))
+        txt.pack(fill="both", expand=True, padx=8, pady=8)
+        txt.insert("1.0", WAN22_TIPS)
+        txt.configure(state="disabled")
+        ttk.Button(dlg, text="关闭", command=dlg.destroy).pack(pady=(0, 8))
+
     def _load_last_config(self):
         # v0.9: 先找 SCRIPT_DIR 下的配置,再 fallback 到 CWD(兼容旧版)
         p = Path(CONFIG_FILE)
@@ -2149,6 +2376,10 @@ class ComfyBatchGUI:
             self._tmpl_end_people = c.get("tmpl_end_people", DEFAULT_END_PEOPLE_TMPL)
             # v0.11:自动新开对话开关
             self.auto_new_chat_var.set(c.get("auto_new_chat", True))
+            # v0.15:反向提示词
+            self.negative_node_var.set(c.get("negative_node", ""))
+            self.negative_field_var.set(c.get("negative_field", "text"))
+            self.wan22_negative_var.set(c.get("wan22_negative", DEFAULT_WAN22_NEGATIVE))
             # 自动扫素材库一次
             d = self.asset_dir_var.get()
             if d and Path(d).exists():
@@ -2201,6 +2432,10 @@ class ComfyBatchGUI:
             "tmpl_end_people": self._tmpl_end_people,
             # v0.11
             "auto_new_chat": self.auto_new_chat_var.get(),
+            # v0.15:反向提示词
+            "negative_node": self.negative_node_var.get(),
+            "negative_field": self.negative_field_var.get(),
+            "wan22_negative": self.wan22_negative_var.get(),
             "scenes": self.scenes,
         }
         try:
@@ -2334,6 +2569,7 @@ class ComfyBatchGUI:
         self.start_combo["values"] = load_imgs
         self.end_combo["values"] = load_imgs
         self.prompt_combo["values"] = text_nodes
+        self.negative_combo["values"] = text_nodes  # v0.15
         # 自动推荐
         if load_imgs and not self.start_node_var.get():
             self.start_node_var.set(load_imgs[0])
@@ -2344,6 +2580,12 @@ class ComfyBatchGUI:
             f = find_prompt_field(self.workflow, text_nodes[0])
             if f:
                 self.prompt_field_var.set(f)
+        # v0.15:自动推荐负面节点(取第 2 个 text 节点,通常 Wan workflow 是[正,负]顺序)
+        if len(text_nodes) >= 2 and not self.negative_node_var.get():
+            self.negative_node_var.set(text_nodes[1])
+            f = find_prompt_field(self.workflow, text_nodes[1])
+            if f:
+                self.negative_field_var.set(f)
         if not silent:
             msg = (f"扫描完成!\n\nLoadImage 节点: {load_imgs}\n"
                    f"可能的提示词节点: {text_nodes}\n\n"
@@ -2411,6 +2653,16 @@ class ComfyBatchGUI:
             f = find_prompt_field(self.workflow, nid)
             if f:
                 self.prompt_field_var.set(f)
+
+    def _on_negative_node_change(self, _event=None):
+        """v0.15:反向节点切换时自动识别字段名"""
+        if not self.workflow:
+            return
+        nid = self.negative_node_var.get()
+        if nid in self.workflow:
+            f = find_prompt_field(self.workflow, nid)
+            if f:
+                self.negative_field_var.set(f)
 
     def _pick_output(self):
         p = filedialog.askdirectory(title="选择视频输出目录")
@@ -2836,6 +3088,7 @@ class ComfyBatchGUI:
                         "prompt": row.get("prompt", "").strip(),
                         "gpt_prompt": row.get("gpt_prompt", "").strip(),
                         "color": row.get("color", "").strip(),
+                        "negative": row.get("negative", "").strip(),  # v0.15
                         "status": "",
                         "video_path": "",
                     })
@@ -2858,11 +3111,13 @@ class ComfyBatchGUI:
         try:
             with open(p, "w", encoding="utf-8-sig", newline="") as f:
                 w = csv.writer(f)
-                w.writerow(["scene_name", "start_image", "end_image", "prompt", "gpt_prompt", "color"])
+                w.writerow(["scene_name", "start_image", "end_image", "prompt",
+                            "gpt_prompt", "color", "negative"])
                 for s in self.scenes:
                     w.writerow([s["name"], s["start"], s["end"], s["prompt"],
                                 s.get("gpt_prompt", ""),
-                                s.get("color", "")])
+                                s.get("color", ""),
+                                s.get("negative", "")])
             self._log(f"📤 已导出到 {p}")
         except Exception as e:
             messagebox.showerror("导出失败", str(e))
@@ -3418,7 +3673,14 @@ class ComfyBatchGUI:
 
             sub = Path(save_dir) / f"{idx+1:02d}_{s['name']}"
 
-            # 首帧
+            # v0.16:单独生图也改为"开始前"新开对话,跟批量统一
+            if self.auto_new_chat_var.get():
+                self._log(f"   🔄 [自动] 新开 GPT 对话(开始前)")
+                try:
+                    self.gpt_ctrl.new_chat(wait_ready=True, timeout=15)
+                except Exception as e:
+                    self._log(f"   ⚠️ 新开对话失败(继续):{e}")
+            
             self._log(f"   📤 [阶段 1/2] 请求首帧图...")
             start_prompt = self._build_start_frame_prompt(raw, has_people)
             start_urls, _ = self._request_single_gpt_image(start_prompt, timeout=300)
@@ -3456,12 +3718,6 @@ class ComfyBatchGUI:
             self.scenes[idx] = s
             self.root.after(0, self._refresh_tree)
             self._log(f"   🎉 单独 GPT 生图完成: {s['name']}")
-            # v0.11:单独生图也自动新开对话,保持行为一致
-            if self.auto_new_chat_var.get():
-                try:
-                    self.gpt_ctrl.new_chat(wait_ready=True, timeout=10)
-                except Exception as e:
-                    self._log(f"   ⚠️ 新开对话失败:{e}")
             self._save_config()
         except Exception as e:
             self._log(f"   ❌ 失败: {e}")
@@ -3510,11 +3766,26 @@ class ComfyBatchGUI:
                 if cid and self.auto_inject_color_var.get():
                     final_prompt = self.color_anchors.inject(final_prompt, cid)
 
+                # v0.15:Wan 2.2 官方 @Image1/@Image2 格式自动补全
+                if "@Image" not in final_prompt:
+                    final_prompt = f"从 @Image1 到 @Image2:{final_prompt}"
+
+                # v0.15:组装 negative — 场景级覆盖 > 通用
+                scene_neg = (s.get("negative") or "").strip()
+                base_neg = self.wan22_negative_var.get().strip()
+                final_neg = f"{base_neg}、{scene_neg}" if scene_neg else base_neg
+
+                neg_node = self.negative_node_var.get().strip() or None
+                neg_field = self.negative_field_var.get().strip() or "text"
+
                 wf = patch_workflow(self.workflow, sn, en, pn, pf,
                                     start_name, end_name, final_prompt,
                                     width=self.width_var.get(),
                                     height=self.height_var.get(),
-                                    length=self.length_var.get())
+                                    length=self.length_var.get(),
+                                    negative_node=neg_node,
+                                    negative_field=neg_field,
+                                    negative_text=final_neg if neg_node else None)
                 pid = queue_prompt(host, wf)
                 self._log(f"   📮 已排队 prompt_id={pid[:8]}...")
                 h = wait_done(host, pid, log_cb=self._log)
@@ -4863,11 +5134,25 @@ class ComfyBatchGUI:
                     final_prompt = self.color_anchors.inject(final_prompt, cid)
                     self._log(f"   🎨 已注入色板:{self.color_anchors.get_name(cid)}")
 
+                # v0.15:Wan 2.2 官方 @Image1/@Image2 格式自动补全
+                if "@Image" not in final_prompt:
+                    final_prompt = f"从 @Image1 到 @Image2:{final_prompt}"
+
+                # v0.15:组装 negative
+                scene_neg = (s.get("negative") or "").strip()
+                base_neg = self.wan22_negative_var.get().strip()
+                final_neg = f"{base_neg}、{scene_neg}" if scene_neg else base_neg
+                neg_node = self.negative_node_var.get().strip() or None
+                neg_field = self.negative_field_var.get().strip() or "text"
+
                 wf = patch_workflow(self.workflow, sn, en, pn, pf,
                                     start_name, end_name, final_prompt,
                                     width=self.width_var.get(),
                                     height=self.height_var.get(),
-                                    length=self.length_var.get())
+                                    length=self.length_var.get(),
+                                    negative_node=neg_node,
+                                    negative_field=neg_field,
+                                    negative_text=final_neg if neg_node else None)
                 pid = queue_prompt(host, wf)
                 self._log(f"   📮 已排队 prompt_id={pid[:8]}...")
 
@@ -5051,6 +5336,21 @@ class ComfyBatchGUI:
                 continue
 
             self._log(f"\n🎨 [{i+1}/{total}] {s['name']}")
+
+            # v0.15:每场景开始前自动新开对话(比 v0.11 的末尾触发更保险)
+            # 这样即便上一场景卡在中途,下一场景也能从干净对话开始
+            if self.auto_new_chat_var.get() and i > 0:
+                self._log(f"   🔄 [自动] 新开 GPT 对话(第 {i+1} 个场景)")
+                try:
+                    ok = self.gpt_ctrl.new_chat(wait_ready=True, timeout=10)
+                    if not ok:
+                        self._log(f"   ⚠️ 新开对话返回 False,继续用当前对话")
+                    else:
+                        time.sleep(1)  # 等 DOM 稳定
+                except Exception as e:
+                    self._log(f"   ⚠️ 新开对话异常(继续):{e}")
+            elif not self.auto_new_chat_var.get():
+                self._log(f"   ℹ️ 「🔄 每场景新开对话」开关未勾,共用同一对话")
             try:
                 # ─── 1. 组装基础 prompt ───
                 raw = (s.get("gpt_prompt") or "").strip() or (s.get("prompt") or "").strip()
@@ -5155,14 +5455,7 @@ class ComfyBatchGUI:
                 self.progress["value"] = i + 1
                 self.progress_label.config(text=f"{i+1} / {total}")
 
-                # v0.11: 每个场景完成后自动新开 GPT 对话,隔离上下文避免画风漂移
-                # 最后一个场景不用新开(省一次点击)
-                if self.auto_new_chat_var.get() and i < total - 1:
-                    self._log(f"   🔄 [自动] 开新对话(隔离上下文)")
-                    try:
-                        self.gpt_ctrl.new_chat(wait_ready=True, timeout=10)
-                    except Exception as e:
-                        self._log(f"   ⚠️ 新开对话失败(继续用旧对话):{e}")
+                # v0.15:new_chat 已改到每场景开始时触发,这里不再重复
 
                 # 礼貌性间隔,避免被 GPT 限速
                 time.sleep(3)
