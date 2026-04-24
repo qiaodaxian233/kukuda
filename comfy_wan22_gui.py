@@ -3,6 +3,14 @@
 """
 ComfyUI Wan 2.2 首尾帧批量生成工具(GUI 版)
 ===========================================
+v0.17 更新日志:
+  - 🆕 额度耗尽自动换号(switch_account)
+    · detect_limit():检测最新回复是否含额度限制文本
+    · switch_account():点「换号」→ SiteTransferNotice 跳转按钮 →
+      aimonkey.plus 第4个账号卡随机点「立即使用」→ 等待回到 GPT 页
+    · _request_single_gpt_image:检测到 limit → 自动换号 → 重新发同一 prompt
+    · 换号最多重试 1 次,换号失败不崩流程,返回空列表
+
 v0.15 更新日志:
   - 🆕 支持 Wan 2.2 官方的【@Image1 / @Image2】格式
     · gpt_prompt 改写模板改为「@Image1 起始动作 @Image2 结束动作」
@@ -145,7 +153,7 @@ v0.1 更新日志:
 运行:python comfy_wan22_gui.py
 """
 
-__version__ = "0.16"
+__version__ = "0.17"
 
 import os
 import sys
@@ -1296,6 +1304,151 @@ class GPTWebController:
             return True
         except Exception:
             return False
+
+    # ------------------------------------------------------------------
+    # v0.17: 额度耗尽检测 + 自动换号
+    # ------------------------------------------------------------------
+
+    # 额度耗尽关键字(英文 + 常见中文镜像站译文)
+    _LIMIT_KEYWORDS = [
+        "You've hit the free plan limit",
+        "hit the free plan limit",
+        "image generation requests",
+        "limit resets in",
+        "额度已用完",
+        "生图额度",
+        "图片生成次数已达上限",
+    ]
+
+    def detect_limit(self):
+        """检测最新 assistant 回复是否含额度限制文本。返回 True = 触发了限制。"""
+        try:
+            txt = self.get_last_reply()
+            if not txt:
+                return False
+            txt_lower = txt.lower()
+            return any(k.lower() in txt_lower for k in self._LIMIT_KEYWORDS)
+        except Exception:
+            return False
+
+    def switch_account(self, timeout=30):
+        """
+        v0.17: 额度耗尽时自动换号流程:
+          1. 点「换号」span
+          2. 点 SiteTransferNotice 跳转按钮
+          3. 等待跳转到 aimonkey.plus
+          4. 在第 4 个账号卡里随机点一个「立即使用」
+          5. 等待跳转回 GPT 页面
+        返回 True = 换号成功并已回到 GPT 页; False = 任一步失败。
+        """
+        import time as _t, random as _r
+        d = self.driver
+        self.log("🔄 检测到额度限制,开始换号流程...")
+
+        # --- Step 1: 点「换号」span ---
+        clicked_huanhao = d.execute_script("""
+            const spans = document.querySelectorAll('span');
+            for (const s of spans) {
+                if (s.textContent.trim() === '换号') { s.click(); return true; }
+            }
+            return false;
+        """)
+        if not clicked_huanhao:
+            self.log("   ⚠️ 未找到「换号」按钮")
+            return False
+        self.log("   ✅ 已点击「换号」")
+        _t.sleep(1)
+
+        # --- Step 2: 点 SiteTransferNotice 跳转按钮 ---
+        clicked_transfer = d.execute_script("""
+            // 精确选择器
+            const sel = 'div.SiteTransferNotice_inner__C2kLC:nth-of-type(2) button.SiteTransferNotice_btn__14cPh';
+            const btn = document.querySelector(sel);
+            if (btn) { btn.click(); return true; }
+            // 兜底:找所有 SiteTransferNotice_btn 里含「确认/跳转/前往」字样的
+            const btns = document.querySelectorAll('[class*="SiteTransferNotice_btn"]');
+            for (const b of btns) {
+                const t = b.textContent.trim();
+                if (t && !t.includes('取消')) { b.click(); return true; }
+            }
+            return false;
+        """)
+        if not clicked_transfer:
+            self.log("   ⚠️ 未找到 SiteTransferNotice 跳转按钮")
+            return False
+        self.log("   ✅ 已点击跳转按钮,等待 aimonkey.plus ...")
+
+        # --- Step 3: 等待跳转到 aimonkey.plus ---
+        deadline = _t.time() + timeout
+        while _t.time() < deadline:
+            try:
+                if "aimonkey.plus" in d.current_url:
+                    break
+            except Exception:
+                pass
+            _t.sleep(0.5)
+        else:
+            self.log("   ⚠️ 等待 aimonkey.plus 超时")
+            return False
+        self.log(f"   ✅ 已到达 {d.current_url}")
+        _t.sleep(2)  # 等页面渲染
+
+        # --- Step 4: 第 4 个账号卡随机点「立即使用」---
+        clicked_use = d.execute_script("""
+            // div.relative > div.max-w-7xl > section > div.max-w-7xl > div.bg-cream-50:nth-of-type(4)
+            const cards = document.querySelectorAll(
+                'div.bg-cream-50.rounded-xl, div[class*="bg-cream-50"][class*="rounded-xl"]');
+            const card = cards[3];   // 第 4 个(0-indexed)
+            if (!card) return 'NO_CARD';
+            const btns = card.querySelectorAll('button');
+            const useBtns = Array.from(btns).filter(b =>
+                b.textContent.includes('立即使用'));
+            if (!useBtns.length) return 'NO_BTN';
+            const picked = useBtns[Math.floor(Math.random() * useBtns.length)];
+            picked.click();
+            return 'OK';
+        """)
+        if clicked_use != "OK":
+            self.log(f"   ⚠️ 第 4 个账号卡点击失败({clicked_use}),尝试任意卡...")
+            # 兜底:随机找任意卡的「立即使用」
+            clicked_use = d.execute_script("""
+                const btns = Array.from(document.querySelectorAll('button'))
+                    .filter(b => b.textContent.includes('立即使用'));
+                if (!btns.length) return 'NO_BTN';
+                btns[Math.floor(Math.random() * btns.length)].click();
+                return 'OK';
+            """)
+            if clicked_use != "OK":
+                self.log("   ⚠️ 找不到任何「立即使用」按钮")
+                return False
+        self.log("   ✅ 已点击「立即使用」,等待回到 GPT ...")
+
+        # --- Step 5: 等待回到 GPT 页 ---
+        while _t.time() < deadline:
+            try:
+                url = d.current_url
+                if "aimonkey" in url and "gpt" in url:
+                    break
+                if "gpt.aimonkey.plus" in url or "openai.com" in url:
+                    break
+            except Exception:
+                pass
+            _t.sleep(0.5)
+
+        # 等输入框出现
+        input_deadline = _t.time() + 10
+        while _t.time() < input_deadline:
+            try:
+                ready = d.execute_script(
+                    f"return !!document.querySelector('{self.INPUT_SELECTOR}');")
+                if ready:
+                    break
+            except Exception:
+                pass
+            _t.sleep(0.5)
+        _t.sleep(1)
+        self.log("   ✅ 换号完成,继续生图")
+        return True
 
     def new_chat(self, wait_ready=True, timeout=15):
         """v0.16:点新聊天按钮 + 彻底等切换完成
@@ -5275,33 +5428,54 @@ class ComfyBatchGUI:
     def _request_single_gpt_image(self, gpt_text, timeout=300, stable_seconds=5):
         """发一次请求 → 等 1 张新图 → 返回新图 URL 列表(可能 >1,由调用者挑)。
 
+        v0.17: 检测到额度限制 → 自动换号 → 重试同一 prompt(最多 1 次)。
+
         返回 (saved_urls, before_snapshot) 元组:
           - saved_urls: 新增图 URL(至少 1 张,否则返回 [])
           - before_snapshot: 发送前对话区已有的 URL 快照(便于下一次调用对比)
         """
-        # 记录发送前基线
-        try:
-            before_urls = self.gpt_ctrl.get_last_images()
-        except Exception:
-            before_urls = []
-        self._log(f"     📊 发送前对话区已有 {len(before_urls)} 张图")
+        for attempt in range(2):  # 最多重试 1 次(换号后重发)
+            # 记录发送前基线
+            try:
+                before_urls = self.gpt_ctrl.get_last_images()
+            except Exception:
+                before_urls = []
+            self._log(f"     📊 发送前对话区已有 {len(before_urls)} 张图")
 
-        # 发送
-        self.gpt_ctrl.send(gpt_text, wait_reply=False)
-        self._log(f"     ⏳ 等待 GPT 生成...")
+            # 发送
+            self.gpt_ctrl.send(gpt_text, wait_reply=False)
+            self._log(f"     ⏳ 等待 GPT 生成...")
 
-        # 等 1 张新图即可(因为我们每次只要 1 张)
-        urls = self.gpt_ctrl.wait_for_images(
-            min_count=1, timeout=timeout, stable_seconds=stable_seconds,
-            before_urls=before_urls)
-        # 尽量多拿:如果 GPT 偶尔还是冒出 2 张,保留更多让调用者挑
-        try:
-            later = self.gpt_ctrl.get_new_images(before_urls)
-            if len(later) > len(urls):
-                urls = later
-        except Exception:
-            pass
-        return urls, before_urls
+            # 等 1 张新图即可
+            urls = self.gpt_ctrl.wait_for_images(
+                min_count=1, timeout=timeout, stable_seconds=stable_seconds,
+                before_urls=before_urls)
+
+            # v0.17: 若无图,检查是否额度耗尽
+            if not urls and self.gpt_ctrl.detect_limit():
+                if attempt == 0:
+                    self._log("   ⚠️ 检测到额度限制,尝试换号...")
+                    ok = self.gpt_ctrl.switch_account()
+                    if ok:
+                        self._log("   🔄 换号成功,重新发送 prompt...")
+                        continue  # 重试
+                    else:
+                        self._log("   ❌ 换号失败,跳过本次生图")
+                        return [], before_urls
+                else:
+                    self._log("   ❌ 换号后仍无图(可能新账号也有限制),跳过")
+                    return [], before_urls
+
+            # 尽量多拿
+            try:
+                later = self.gpt_ctrl.get_new_images(before_urls)
+                if len(later) > len(urls):
+                    urls = later
+            except Exception:
+                pass
+            return urls, before_urls
+
+        return [], []
 
     def _batch_gpt_images(self, save_dir, only_missing):
         Path(save_dir).mkdir(parents=True, exist_ok=True)
