@@ -3,6 +3,12 @@
 """
 ComfyUI Wan 2.2 首尾帧批量生成工具(GUI 版)
 ===========================================
+v0.18 更新日志:
+  - 🐛 修复:单独生图参考图被 new_chat 清空的 bug
+    · 原顺序:上传参考图 → new_chat(清掉了!) → 发 prompt → 无参考图
+    · 修复后:new_chat → 上传参考图 → 发 prompt(与批量流程对齐)
+    · 单独生图首尾帧都无参考图的根因修复
+
 v0.17 更新日志:
   - 🆕 额度耗尽自动换号(switch_account)
     · detect_limit():检测最新回复是否含额度限制文本
@@ -153,7 +159,7 @@ v0.1 更新日志:
 运行:python comfy_wan22_gui.py
 """
 
-__version__ = "0.17"
+__version__ = "0.18"
 
 import os
 import sys
@@ -3812,9 +3818,22 @@ class ComfyBatchGUI:
             has_people = any(kw in raw for kw in self._PEOPLE_KEYWORDS)
             self._log(f"   🧭 prompt 模式:{'人物镜头' if has_people else '纯环境空镜'}")
 
-            # 素材库匹配上传
+            # 素材库匹配(先算好路径,但等 new_chat 后再上传)
             matched = self.asset_lib.match(raw) if self.asset_lib._index else []
             ref_paths = [p for _, p in matched]
+
+            sub = Path(save_dir) / f"{idx+1:02d}_{s['name']}"
+
+            # v0.18:new_chat 必须在 upload 之前 — 否则 new_chat 会清掉刚上传的图
+            # 正确顺序:new_chat → upload → send(与批量流程对齐)
+            if self.auto_new_chat_var.get():
+                self._log(f"   🔄 [自动] 新开 GPT 对话(开始前)")
+                try:
+                    self.gpt_ctrl.new_chat(wait_ready=True, timeout=15)
+                except Exception as e:
+                    self._log(f"   ⚠️ 新开对话失败(继续):{e}")
+
+            # new_chat 完成后再上传参考图
             if ref_paths and self.auto_upload_var.get():
                 self._log(f"   📎 匹配到 {len(ref_paths)} 张参考图:"
                           f"{', '.join(k for k, _ in matched)}")
@@ -3823,16 +3842,6 @@ class ComfyBatchGUI:
                     time.sleep(1.5)
                 except Exception as e:
                     self._log(f"   ⚠️ 参考图上传失败(继续发送):{e}")
-
-            sub = Path(save_dir) / f"{idx+1:02d}_{s['name']}"
-
-            # v0.16:单独生图也改为"开始前"新开对话,跟批量统一
-            if self.auto_new_chat_var.get():
-                self._log(f"   🔄 [自动] 新开 GPT 对话(开始前)")
-                try:
-                    self.gpt_ctrl.new_chat(wait_ready=True, timeout=15)
-                except Exception as e:
-                    self._log(f"   ⚠️ 新开对话失败(继续):{e}")
             
             self._log(f"   📤 [阶段 1/2] 请求首帧图...")
             start_prompt = self._build_start_frame_prompt(raw, has_people)
